@@ -1,0 +1,394 @@
+name: Build Unity iOS
+
+run-name: xbuild • ${{ inputs.build_id }} • ${{ inputs.export_method }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Unique desktop build ID used to correlate the dispatched run
+        required: true
+        type: string
+      upload_release_tag:
+        description: Draft release tag containing the uploaded Xcode project archive
+        required: true
+        type: string
+      upload_release_id:
+        description: Numeric ID of the temporary draft release
+        required: true
+        type: string
+      upload_asset_name:
+        description: Exact ZIP asset name in the draft release
+        required: true
+        type: string
+      upload_asset_id:
+        description: Exact GitHub release asset ID (preferred over tag lookup)
+        required: false
+        default: ""
+        type: string
+      archive_sha256:
+        description: SHA-256 of the uploaded ZIP
+        required: true
+        type: string
+      export_method:
+        description: IPA distribution method
+        required: true
+        default: development
+        type: choice
+        options:
+          - development
+          - ad-hoc
+          - app-store
+      scheme:
+        description: Optional shared scheme override (normally auto-detected)
+        required: false
+        default: ""
+        type: string
+      configuration:
+        description: Optional build configuration override (normally Release)
+        required: false
+        default: ""
+        type: string
+      bundle_identifier:
+        description: Optional expected bundle identifier used to disambiguate schemes
+        required: false
+        default: ""
+        type: string
+      project_hint:
+        description: Optional source-relative .xcodeproj or .xcworkspace path from desktop detection
+        required: false
+        default: ""
+        type: string
+      signing_set:
+        description: Optional named Apple signing set key; blank keeps legacy IOS_* secrets
+        required: false
+        default: ""
+        type: string
+      cleanup_upload:
+        description: Delete the temporary draft release after the run
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: xbuild-ios-${{ inputs.upload_release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-ios:
+    name: Build IPA on macOS
+    runs-on: ${{ vars.XBUILD_MACOS_RUNNER || 'macos-26' }}
+    timeout-minutes: 120
+    env:
+      XBUILD_BUILD_ID: ${{ inputs.build_id }}
+      XBUILD_SOURCE_SHA256: ${{ inputs.archive_sha256 }}
+      XBUILD_EXPORT_METHOD: ${{ inputs.export_method }}
+      XBUILD_REQUESTED_SCHEME: ${{ inputs.scheme }}
+      XBUILD_REQUESTED_CONFIGURATION: ${{ inputs.configuration }}
+      XBUILD_REQUESTED_BUNDLE_ID: ${{ inputs.bundle_identifier }}
+      XBUILD_PROJECT_HINT: ${{ inputs.project_hint }}
+      XBUILD_SIGNING_SET: ${{ inputs.signing_set }}
+      XBUILD_XCODE_PATH: ${{ vars.XBUILD_XCODE_PATH }}
+
+    steps:
+      - name: Initialize build workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir="${RUNNER_TEMP%/}/xbuild-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source_dir="$work_dir/source"
+          output_dir="$work_dir/output"
+          log_dir="$work_dir/logs"
+          signing_dir="$work_dir/signing"
+
+          {
+            printf 'XBUILD_WORK_DIR=%s\n' "$work_dir"
+            printf 'XBUILD_SOURCE_DIR=%s\n' "$source_dir"
+            printf 'XBUILD_OUTPUT_DIR=%s\n' "$output_dir"
+            printf 'XBUILD_LOG_DIR=%s\n' "$log_dir"
+            printf 'XBUILD_SIGNING_DIR=%s\n' "$signing_dir"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p -- "$work_dir" "$source_dir" "$output_dir" "$log_dir" "$signing_dir"
+
+      - name: Check out trusted build scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select and show macOS build toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${XBUILD_XCODE_PATH:-}" ]]; then
+            developer_dir="${XBUILD_XCODE_PATH%/}"
+            if [[ "$developer_dir" == *.app ]]; then
+              developer_dir="$developer_dir/Contents/Developer"
+            fi
+            case "$developer_dir" in
+              /Applications/Xcode*.app/Contents/Developer) ;;
+              *)
+                echo "::error title=Invalid Xcode path::XBUILD_XCODE_PATH must point to an Xcode app under /Applications."
+                exit 2
+                ;;
+            esac
+            if [[ ! -d "$developer_dir" ]]; then
+              echo "::error title=Xcode not found::$developer_dir does not exist on this runner image."
+              exit 2
+            fi
+            sudo xcode-select --switch "$developer_dir"
+          fi
+          sw_vers
+          echo "Architecture: $(uname -m)"
+          xcodebuild -version
+          ruby --version
+          pod --version || echo "CocoaPods is not preinstalled; it will be installed if a Podfile is found."
+
+          xcode_major="$(xcodebuild -version | awk '/^Xcode / { split($2, version, "."); print version[1]; exit }')"
+          if [[ "$XBUILD_EXPORT_METHOD" == "app-store" ]] &&
+             { [[ ! "$xcode_major" =~ ^[0-9]+$ ]] || (( xcode_major < 26 )); }; then
+            echo "::error title=Xcode 26 required::App Store Connect uploads have required Xcode 26 or newer since April 28, 2026. Select a compatible runner/Xcode using XBUILD_MACOS_RUNNER and XBUILD_XCODE_PATH."
+            exit 2
+          fi
+
+      - name: Validate request
+        shell: bash
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+          UPLOAD_ASSET_NAME: ${{ inputs.upload_asset_name }}
+          UPLOAD_ASSET_ID: ${{ inputs.upload_asset_id }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+          PROJECT_HINT: ${{ inputs.project_hint }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BUILD_ID" || "$BUILD_ID" == *$'\n'* || "$BUILD_ID" == *$'\r'* ]]; then
+            echo "::error title=Invalid build ID::build_id must be a non-empty, single-line value."
+            exit 2
+          fi
+          if [[ ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
+            echo "::error title=Invalid upload tag::upload_release_tag must begin with 'xbuild-upload-' and contain only safe tag characters."
+            exit 2
+          fi
+          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid upload release ID::upload_release_id must contain digits only."
+            exit 2
+          fi
+          if [[ -z "$UPLOAD_ASSET_NAME" || "$UPLOAD_ASSET_NAME" == */* || "$UPLOAD_ASSET_NAME" == *\\* || "$UPLOAD_ASSET_NAME" == *$'\n'* || "$UPLOAD_ASSET_NAME" == *$'\r'* ]]; then
+            echo "::error title=Invalid upload asset::upload_asset_name must be a simple file name."
+            exit 2
+          fi
+          if [[ -n "$UPLOAD_ASSET_ID" && ! "$UPLOAD_ASSET_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid upload asset ID::upload_asset_id must contain digits only."
+            exit 2
+          fi
+          if [[ ! "$ARCHIVE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error title=Invalid source checksum::archive_sha256 must be a 64-character SHA-256 value."
+            exit 2
+          fi
+          normalized_hint="$(printf '%s' "$PROJECT_HINT" | tr '\\' '/')"
+          invalid_hint=false
+          case "$PROJECT_HINT" in *$'\n'*|*$'\r'*) invalid_hint=true ;; esac
+          case "$normalized_hint" in /*|[A-Za-z]:*) invalid_hint=true ;; esac
+          case "/$normalized_hint/" in */../*) invalid_hint=true ;; esac
+          if [[ "$invalid_hint" == "true" ]]; then
+            echo "::error title=Invalid project hint::project_hint must be a source-relative path without parent traversal."
+            exit 2
+          fi
+          case "$XBUILD_EXPORT_METHOD" in
+            development|ad-hoc|app-store) ;;
+            *)
+              echo "::error title=Invalid export method::Expected development, ad-hoc, or app-store."
+              exit 2
+              ;;
+          esac
+          if [[ -n "$XBUILD_SIGNING_SET" && ! "$XBUILD_SIGNING_SET" =~ ^[A-Z0-9][A-Z0-9_]{0,31}$ ]]; then
+            echo "::error title=Invalid signing set::signing_set must start with A-Z or 0-9, contain only A-Z, 0-9, or underscore, and be at most 32 characters."
+            exit 2
+          fi
+      - name: Download uploaded Xcode project
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+          UPLOAD_ASSET_NAME: ${{ inputs.upload_asset_name }}
+          UPLOAD_ASSET_ID: ${{ inputs.upload_asset_id }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          release_json="$XBUILD_WORK_DIR/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json"
+          actual_tag="$(jq -r '.tag_name' "$release_json")"
+          is_draft="$(jq -r '.draft' "$release_json")"
+          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
+            echo "::error title=Upload release mismatch::Release ID $UPLOAD_RELEASE_ID must be the draft release tagged '$UPLOAD_RELEASE_TAG'."
+            exit 3
+          fi
+          asset_id="$UPLOAD_ASSET_ID"
+          if [[ -n "$asset_id" ]]; then
+            actual_name="$(jq -r --arg id "$asset_id" '.assets[] | select((.id | tostring) == $id) | .name' "$release_json" | head -n 1)"
+            if [[ -z "$actual_name" ]]; then
+              echo "::error title=Upload mismatch::Asset ID $asset_id does not belong to release ID $UPLOAD_RELEASE_ID."
+              exit 3
+            fi
+            if [[ "$actual_name" != "$UPLOAD_ASSET_NAME" ]]; then
+              echo "::error title=Upload mismatch::Asset ID $asset_id is named '$actual_name', not '$UPLOAD_ASSET_NAME'."
+              exit 3
+            fi
+          else
+            asset_id="$(jq -r --arg name "$UPLOAD_ASSET_NAME" '.assets[] | select(.name == $name) | .id' "$release_json" | head -n 1)"
+          fi
+          if [[ -z "$asset_id" ]]; then
+            echo "::error title=Upload not found::Asset '$UPLOAD_ASSET_NAME' was not found in release '$UPLOAD_RELEASE_TAG'."
+            exit 3
+          fi
+          archive="$XBUILD_WORK_DIR/$UPLOAD_ASSET_NAME"
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$archive"
+          if [[ ! -s "$archive" ]]; then
+            echo "::error title=Empty upload::The downloaded Xcode archive is empty."
+            exit 3
+          fi
+          actual_sha256="$(shasum -a 256 "$archive" | awk '{print tolower($1)}')"
+          expected_sha256="$(printf '%s' "$ARCHIVE_SHA256" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+            echo "::error title=Source checksum mismatch::Expected $expected_sha256 but downloaded $actual_sha256. The upload may be incomplete or corrupted."
+            exit 3
+          fi
+          echo "Downloaded $(du -h "$archive" | awk '{print $1}') upload."
+          echo "Verified source archive SHA-256: $actual_sha256"
+          printf 'XBUILD_SOURCE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+
+      - name: Extract and validate Xcode project
+        shell: bash
+        run: bash scripts/macos/prepare-source.sh "$XBUILD_SOURCE_ARCHIVE" "$XBUILD_SOURCE_DIR"
+
+      - name: Install CocoaPods dependencies on macOS
+        shell: bash
+        run: bash scripts/macos/install-cocoapods.sh "$XBUILD_SOURCE_DIR" "$XBUILD_LOG_DIR" "$XBUILD_PROJECT_HINT"
+
+      - name: Detect Xcode container, scheme, configuration, and bundle ID
+        shell: bash
+        run: bash scripts/macos/detect-xcode.sh "$XBUILD_SOURCE_DIR" "$GITHUB_ENV" "$XBUILD_WORK_DIR"
+
+      - name: Install signing certificate and provisioning profiles
+        shell: bash
+        env:
+          # A non-empty signing_set selects an isolated XBUILD_SIGNING_<SET>_*
+          # namespace. Missing values never fall through to another Apple team.
+          XBUILD_SET_MODE_CERTIFICATE_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_DEVELOPMENT_BASE64', inputs.signing_set)] || inputs.export_method == 'ad-hoc' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_ADHOC_BASE64', inputs.signing_set)] || inputs.export_method == 'app-store' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_APPSTORE_BASE64', inputs.signing_set)] || '' }}
+          XBUILD_SET_MODE_CERTIFICATE_PASSWORD: >-
+            ${{ inputs.export_method == 'development' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_DEVELOPMENT_PASSWORD', inputs.signing_set)] || inputs.export_method == 'ad-hoc' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_ADHOC_PASSWORD', inputs.signing_set)] || inputs.export_method == 'app-store' && secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_APPSTORE_PASSWORD', inputs.signing_set)] || '' }}
+          XBUILD_SET_MODE_PROFILES_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_DEVELOPMENT_BASE64', inputs.signing_set)] || inputs.export_method == 'ad-hoc' && secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_ADHOC_BASE64', inputs.signing_set)] || inputs.export_method == 'app-store' && secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_APPSTORE_BASE64', inputs.signing_set)] || '' }}
+          XBUILD_SET_MODE_PROFILE_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets[format('XBUILD_SIGNING_{0}_PROFILE_DEVELOPMENT_BASE64', inputs.signing_set)] || inputs.export_method == 'ad-hoc' && secrets[format('XBUILD_SIGNING_{0}_PROFILE_ADHOC_BASE64', inputs.signing_set)] || inputs.export_method == 'app-store' && secrets[format('XBUILD_SIGNING_{0}_PROFILE_APPSTORE_BASE64', inputs.signing_set)] || '' }}
+          XBUILD_SET_COMMON_CERTIFICATE_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_BASE64', inputs.signing_set)] }}
+          XBUILD_SET_COMMON_CERTIFICATE_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_PASSWORD', inputs.signing_set)] }}
+          XBUILD_SET_COMMON_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_BASE64', inputs.signing_set)] }}
+          XBUILD_SET_COMMON_PROFILE_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILE_BASE64', inputs.signing_set)] }}
+          XBUILD_SET_TEAM_ID_OVERRIDE: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
+
+          # Blank signing_set preserves repositories configured by older XBuild
+          # versions. These are intentionally ignored for a named signing set.
+          # Mode-specific credentials take precedence. Common credentials keep the
+          # one-time setup small when the same certificate is usable for all modes.
+          XBUILD_MODE_CERTIFICATE_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_BASE64 || '' }}
+          XBUILD_MODE_CERTIFICATE_PASSWORD: >-
+            ${{ inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_PASSWORD || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_PASSWORD || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_PASSWORD || '' }}
+          XBUILD_MODE_PROFILES_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets.IOS_PROVISIONING_PROFILES_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROVISIONING_PROFILES_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROVISIONING_PROFILES_APPSTORE_BASE64 || '' }}
+          XBUILD_MODE_PROFILE_BASE64: >-
+            ${{ inputs.export_method == 'development' && secrets.IOS_PROFILE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROFILE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROFILE_APPSTORE_BASE64 || '' }}
+          XBUILD_COMMON_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          XBUILD_COMMON_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          XBUILD_COMMON_PROFILES_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILES_BASE64 }}
+          XBUILD_COMMON_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          XBUILD_LEGACY_TEAM_ID_OVERRIDE: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/macos/install-signing.sh "$XBUILD_BUNDLE_IDS_FILE" "$GITHUB_ENV"
+
+      - name: Configure Xcode targets for manual signing
+        shell: bash
+        run: bash scripts/macos/configure-signing.sh "$XBUILD_SOURCE_DIR" "$XBUILD_SIGNING_MAP" "$XBUILD_DETECTED_BUILD_FILE"
+
+      - name: Archive and export IPA
+        shell: bash
+        run: bash scripts/macos/build-ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.XBUILD_OUTPUT_DIR }}
+            ${{ env.XBUILD_LOG_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload diagnostics when the build fails
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XBUILD_LOG_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/macos/cleanup-signing.sh
+
+      - name: Delete temporary upload release
+        if: ${{ always() && inputs.cleanup_upload }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$XBUILD_WORK_DIR"
+          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ || ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
+            echo "::warning title=Upload retained::Refusing to delete an upload with an unexpected release ID or tag."
+            exit 0
+          fi
+          release_json="$XBUILD_WORK_DIR/cleanup-release.json"
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json" 2>/dev/null; then
+            echo "Temporary release was already removed."
+            exit 0
+          fi
+          actual_tag="$(jq -r '.tag_name' "$release_json")"
+          is_draft="$(jq -r '.draft' "$release_json")"
+          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
+            echo "::warning title=Upload retained::Release ID, tag, or draft state no longer matches the temporary upload."
+            exit 0
+          fi
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID"
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$UPLOAD_RELEASE_TAG" >/dev/null 2>&1 || true
+          rm -f -- "$release_json"
+          echo "Deleted temporary draft release '$UPLOAD_RELEASE_TAG' (ID $UPLOAD_RELEASE_ID)."
+
+      - name: Remove build temporary files
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_prefix="${RUNNER_TEMP%/}/xbuild-"
+          case "$XBUILD_WORK_DIR" in
+            "$expected_prefix"*) rm -rf -- "$XBUILD_WORK_DIR" ;;
+            *) echo "::warning title=Cleanup skipped::Unexpected work directory: $XBUILD_WORK_DIR" ;;
+          esac
