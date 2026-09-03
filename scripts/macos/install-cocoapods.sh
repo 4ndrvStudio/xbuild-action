@@ -5,6 +5,7 @@ set -euo pipefail
 source_root="${1:?Usage: install-cocoapods.sh <source-root> <log-dir> [project-hint]}"
 log_dir="${2:?Usage: install-cocoapods.sh <source-root> <log-dir> [project-hint]}"
 project_hint="${3:-${XBUILD_PROJECT_HINT:-}}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source_root="$(cd "$source_root" && pwd -P)"
 mkdir -p "$log_dir"
 
@@ -78,6 +79,15 @@ fi
 podfiles=("${selected_podfiles[@]}")
 echo "Selected ${#podfiles[@]} Podfile(s). CocoaPods will run only on the macOS runner."
 
+minimum_cocoapods_version="1.7.2"
+
+cocoapods_version_supported() {
+  local version="$1"
+  ruby -rrubygems -e \
+    'exit(Gem::Version.new(ARGV.fetch(0)) >= Gem::Version.new(ARGV.fetch(1)) ? 0 : 1)' \
+    "$version" "$minimum_cocoapods_version" >/dev/null 2>&1
+}
+
 install_cocoapods_version() {
   local required_version="$1"
   if [[ -n "$required_version" ]]; then
@@ -89,6 +99,13 @@ install_cocoapods_version() {
   elif ! command -v pod >/dev/null 2>&1; then
     echo "Installing the current CocoaPods release..."
     sudo gem install cocoapods --no-document
+  else
+    local installed_version
+    installed_version="$(pod --version 2>/dev/null | awk 'NF { version=$0 } END { print version }' | tr -d '\r')"
+    if ! cocoapods_version_supported "$installed_version"; then
+      echo "Runner CocoaPods $installed_version is older than the CDN minimum $minimum_cocoapods_version; installing the current release..."
+      sudo gem install cocoapods --no-document
+    fi
   fi
 }
 
@@ -123,14 +140,18 @@ for podfile in "${podfiles[@]}"; do
   pod_log="$log_dir/cocoapods-$index.log"
   required_version=""
 
+  echo "::group::CocoaPods $index/${#podfiles[@]} — $pod_dir"
+
   if [[ -f "$pod_dir/Podfile.lock" ]]; then
     required_version="$(awk '/^COCOAPODS: / { print $2; exit }' "$pod_dir/Podfile.lock" | tr -d '\r')"
   fi
 
-  echo "::group::CocoaPods $index/${#podfiles[@]} — $pod_dir"
   pod_command=()
   use_bundler=false
   if [[ -f "$pod_dir/Gemfile" ]]; then
+    if ! command -v bundle >/dev/null 2>&1; then
+      sudo gem install bundler --no-document
+    fi
     if gemfile_cocoapods_status "$pod_dir"; then
       use_bundler=true
     else
@@ -138,7 +159,9 @@ for podfile in "${podfiles[@]}"; do
       if (( gemfile_status == 10 )); then
         echo "Gemfile does not declare CocoaPods; using Podfile.lock or the runner CocoaPods instead."
       else
-        echo "::warning title=Gemfile inspection failed::Could not inspect the Gemfile for CocoaPods; using Podfile.lock or the runner CocoaPods instead."
+        echo "::endgroup::"
+        echo "::error title=Gemfile inspection failed::Could not safely determine whether the Gemfile pins CocoaPods. Fix the Gemfile/Gemfile.lock or remove it from the export before building."
+        exit 20
       fi
     fi
   fi
@@ -164,13 +187,37 @@ for podfile in "${podfiles[@]}"; do
     fi
   fi
 
-  if [[ -n "$required_version" ]]; then
+  if [[ -n "$required_version" && "$use_bundler" != "true" ]]; then
     echo "Podfile.lock requests CocoaPods $required_version."
   fi
-  (
+
+  pod_version_output="$(
     cd "$pod_dir"
     "${pod_command[@]}" --version
-  )
+  )"
+  printf '%s\n' "$pod_version_output"
+  resolved_pod_version="$(printf '%s\n' "$pod_version_output" | awk 'NF { version=$0 } END { print version }' | tr -d '\r')"
+  if ! cocoapods_version_supported "$resolved_pod_version"; then
+    if [[ "$use_bundler" == "true" ]]; then
+      echo "::warning title=Legacy bundled CocoaPods::Gemfile/Gemfile.lock resolves CocoaPods $resolved_pod_version, which predates CDN support. XBuild will honor the pin and keep the legacy public Specs source for this build."
+      normalize_public_specs=false
+    elif [[ -n "$required_version" ]]; then
+      echo "::warning title=Legacy locked CocoaPods::Podfile.lock requests CocoaPods $resolved_pod_version, which predates CDN support. XBuild will honor that version and keep the legacy public Specs source for this build."
+      normalize_public_specs=false
+    else
+      echo "::endgroup::"
+      echo "::error title=CocoaPods is too old::Resolved CocoaPods $resolved_pod_version, but the normalized CDN source requires $minimum_cocoapods_version or newer."
+      exit 20
+    fi
+  else
+    normalize_public_specs=true
+  fi
+
+  if [[ "$normalize_public_specs" == "true" ]]; then
+    python3 "$script_dir/normalize-podfile-sources.py" "$source_root" "$podfile"
+  else
+    echo "Podfile source normalization skipped to remain compatible with explicitly selected CocoaPods $resolved_pod_version."
+  fi
 
   set +e
   (
