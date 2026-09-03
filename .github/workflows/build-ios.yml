@@ -272,9 +272,12 @@ jobs:
           APPSTORE_CERTIFICATE_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_APPSTORE_PASSWORD', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_PASSWORD', inputs.signing_set)] }}
           APPSTORE_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_APPSTORE_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_APPSTORE_BASE64', inputs.signing_set)] }}
           SIGNING_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
+          TESTFLIGHT_AUTH_METHOD: ${{ secrets[format('XBUILD_SIGNING_{0}_TESTFLIGHT_AUTH_METHOD', inputs.signing_set)] }}
           ASC_KEY_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] != '' }}
           ASC_ISSUER_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] != '' }}
           ASC_PRIVATE_KEY_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] != '' }}
+          APPLE_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] != '' }}
+          APP_SPECIFIC_PASSWORD_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] != '' }}
         run: |
           set -euo pipefail
           umask 077
@@ -288,9 +291,35 @@ jobs:
           [[ -z "$APPSTORE_CERTIFICATE_BASE64" ]] && missing+=("App Store distribution certificate")
           [[ -z "$APPSTORE_PROFILES_BASE64" ]] && missing+=("App Store provisioning profiles")
           [[ -z "$SIGNING_TEAM_ID" ]] && missing+=("Apple Team ID")
-          [[ "$ASC_KEY_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Key ID")
-          [[ "$ASC_ISSUER_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Issuer ID")
-          [[ "$ASC_PRIVATE_KEY_CONFIGURED" != "true" ]] && missing+=("App Store Connect private key")
+          selected_auth="$TESTFLIGHT_AUTH_METHOD"
+          if [[ -z "$selected_auth" ]]; then
+            if [[ "$ASC_KEY_ID_CONFIGURED" == "true" &&
+                  "$ASC_ISSUER_ID_CONFIGURED" == "true" &&
+                  "$ASC_PRIVATE_KEY_CONFIGURED" == "true" ]]; then
+              selected_auth="api-key"
+            elif [[ "$APPLE_ID_CONFIGURED" == "true" &&
+                    "$APP_SPECIFIC_PASSWORD_CONFIGURED" == "true" ]]; then
+              selected_auth="apple-id"
+            fi
+          fi
+          case "$selected_auth" in
+            api-key)
+              [[ "$ASC_KEY_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Key ID")
+              [[ "$ASC_ISSUER_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Issuer ID")
+              [[ "$ASC_PRIVATE_KEY_CONFIGURED" != "true" ]] && missing+=("App Store Connect private key")
+              ;;
+            apple-id)
+              [[ "$APPLE_ID_CONFIGURED" != "true" ]] && missing+=("Apple ID")
+              [[ "$APP_SPECIFIC_PASSWORD_CONFIGURED" != "true" ]] && missing+=("Apple app-specific password")
+              ;;
+            "")
+              missing+=("TestFlight authentication (API key or Apple ID + app-specific password)")
+              ;;
+            *)
+              echo "::error title=Invalid TestFlight authentication::TESTFLIGHT_AUTH_METHOD must be api-key or apple-id. Re-save this Apple Team in XBuild."
+              exit 2
+              ;;
+          esac
           if (( ${#missing[@]} > 0 )); then
             printf '::error title=TestFlight setup incomplete::Missing: %s.\n' "$(IFS=', '; echo "${missing[*]}")"
             exit 2
@@ -308,6 +337,7 @@ jobs:
             echo "::error title=Apple Team mismatch::The selected Team ID does not match the Team ID stored in its GitHub secret namespace."
             exit 2
           fi
+          echo "TestFlight authentication preflight passed using $selected_auth."
 
       - name: Download uploaded Xcode project
         shell: bash
@@ -542,9 +572,13 @@ jobs:
       - name: Upload App Store IPA
         shell: bash
         env:
+          XBUILD_TESTFLIGHT_AUTH_METHOD: ${{ secrets[format('XBUILD_SIGNING_{0}_TESTFLIGHT_AUTH_METHOD', inputs.signing_set)] }}
           XBUILD_ASC_KEY_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] }}
           XBUILD_ASC_ISSUER_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] }}
           XBUILD_ASC_PRIVATE_KEY_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] }}
+          XBUILD_APPLE_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] }}
+          XBUILD_APP_SPECIFIC_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] }}
+          XBUILD_APPLE_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
         run: |
           set -euo pipefail
           app_store_ipas=()
