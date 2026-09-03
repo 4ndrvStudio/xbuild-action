@@ -28,7 +28,7 @@ def main() -> int:
         "manageAppVersionAndBuildNumber": False,
         "method": export_methods[semantic_method],
         "provisioningProfiles": {
-            bundle_id: profile["name"]
+            bundle_id: profile["uuid"]
             for bundle_id, profile in signing["profiles"].items()
         },
         "signingCertificate": signing["certificate_identity"],

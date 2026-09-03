@@ -216,6 +216,17 @@ def signable_settings(settings_json: Any) -> list[dict[str, str]]:
                 "target": str(entry.get("target", "")),
                 "bundle_identifier": bundle_id,
                 "project_file_path": str(settings.get("PROJECT_FILE_PATH", "")).strip(),
+                "project_dir": str(settings.get("PROJECT_DIR", "")).strip(),
+                "info_plist_file": str(settings.get("INFOPLIST_FILE", "")).strip(),
+                "generate_info_plist_file": str(
+                    settings.get("GENERATE_INFOPLIST_FILE", "")
+                ).upper(),
+                "current_project_version": str(
+                    settings.get("CURRENT_PROJECT_VERSION", "")
+                ).strip(),
+                "info_plist_bundle_version": str(
+                    settings.get("INFOPLIST_KEY_CFBundleVersion", "")
+                ).strip(),
                 "wrapper_extension": wrapper,
                 "product_type": product_type,
                 "skip_install": str(settings.get("SKIP_INSTALL", "")).upper(),

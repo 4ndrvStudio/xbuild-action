@@ -10,6 +10,10 @@ signing_map="${XBUILD_SIGNING_MAP:?XBUILD_SIGNING_MAP is required}"
 work_dir="${XBUILD_WORK_DIR:?XBUILD_WORK_DIR is required}"
 output_dir="${XBUILD_OUTPUT_DIR:?XBUILD_OUTPUT_DIR is required}"
 log_dir="${XBUILD_LOG_DIR:?XBUILD_LOG_DIR is required}"
+upload_testflight="${XBUILD_UPLOAD_TESTFLIGHT:-false}"
+export_method="${XBUILD_EXPORT_METHOD:?XBUILD_EXPORT_METHOD is required}"
+export_compliance="${XBUILD_EXPORT_COMPLIANCE:-preserve}"
+export_compliance_code="${XBUILD_EXPORT_COMPLIANCE_CODE:-}"
 
 case "$container_kind" in
   workspace) container_args=(-workspace "$container_path") ;;
@@ -22,10 +26,70 @@ esac
 
 mkdir -p "$output_dir" "$log_dir"
 archive_path="$work_dir/app.xcarchive"
-export_options="$work_dir/ExportOptions.plist"
 result_bundle="$work_dir/archive.xcresult"
+archive_overrides=(COMPILER_INDEX_STORE_ENABLE=NO)
 
-python3 scripts/macos/make-export-options.py "$signing_map" "$export_options"
+redact_export_compliance_code() {
+  python3 -u -c '
+import os
+import sys
+
+value = os.environ.get("XBUILD_EXPORT_COMPLIANCE_CODE", "")
+for line in sys.stdin:
+    sys.stdout.write(line.replace(value, "[REDACTED]") if value else line)
+'
+}
+
+compliance_applies=false
+if [[ "$export_method" == "app-store" || "$upload_testflight" == "true" ]]; then
+  compliance_applies=true
+  source_dir="${XBUILD_SOURCE_DIR:?XBUILD_SOURCE_DIR is required for App Store export compliance}"
+  detected_build="${XBUILD_DETECTED_BUILD_FILE:?XBUILD_DETECTED_BUILD_FILE is required for App Store export compliance}"
+  python3 scripts/macos/configure-export-compliance.py patch \
+    --source-root "$source_dir" \
+    --detected-build "$detected_build" \
+    --mode "$export_compliance" \
+    --compliance-code "$export_compliance_code"
+  case "$export_compliance" in
+    exempt)
+      archive_overrides+=(
+        "INFOPLIST_KEY_ITSAppUsesNonExemptEncryption=NO"
+        "INFOPLIST_KEY_ITSEncryptionExportComplianceCode="
+      )
+      ;;
+    non-exempt)
+      archive_overrides+=(
+        "INFOPLIST_KEY_ITSAppUsesNonExemptEncryption=YES"
+        "INFOPLIST_KEY_ITSEncryptionExportComplianceCode=$export_compliance_code"
+      )
+      ;;
+    preserve) ;;
+    *)
+      echo "::error title=Invalid export compliance mode::Expected exempt, non-exempt, or preserve."
+      exit 45
+      ;;
+  esac
+fi
+
+if [[ "$upload_testflight" == "true" ]]; then
+  source_dir="${XBUILD_SOURCE_DIR:?XBUILD_SOURCE_DIR is required for TestFlight mode}"
+  detected_build="${XBUILD_DETECTED_BUILD_FILE:?XBUILD_DETECTED_BUILD_FILE is required for TestFlight mode}"
+  build_number_file="$work_dir/project-build-number.txt"
+  python3 scripts/macos/set-build-number.py resolve \
+    --source-root "$source_dir" \
+    --detected-build "$detected_build" \
+    --output "$build_number_file"
+  build_number="$(tr -d '\r\n' < "$build_number_file")"
+  export XBUILD_EFFECTIVE_BUILD_NUMBER="$build_number"
+  python3 scripts/macos/set-build-number.py patch \
+    --source-root "$source_dir" \
+    --detected-build "$detected_build" \
+    --build-number "$build_number"
+  archive_overrides+=(
+    "CURRENT_PROJECT_VERSION=$build_number"
+    "INFOPLIST_KEY_CFBundleVersion=$build_number"
+  )
+fi
 
 echo "::group::xcodebuild archive"
 echo "Archiving scheme '$scheme' ($configuration) from $(basename "$container_path")..."
@@ -38,8 +102,8 @@ NSUnbufferedIO=YES xcodebuild \
   -destination 'generic/platform=iOS' \
   -archivePath "$archive_path" \
   -resultBundlePath "$result_bundle" \
-  COMPILER_INDEX_STORE_ENABLE=NO \
-  archive 2>&1 | tee "$log_dir/xcodebuild-archive.log"
+  "${archive_overrides[@]}" \
+  archive 2>&1 | redact_export_compliance_code | tee "$log_dir/xcodebuild-archive.log"
 archive_status=${PIPESTATUS[0]}
 set -e
 echo "::endgroup::"
@@ -53,28 +117,91 @@ if [[ ! -d "$archive_path" ]]; then
   exit 41
 fi
 
-echo "::group::xcodebuild exportArchive"
-set +e
-NSUnbufferedIO=YES xcodebuild \
-  -exportArchive \
-  -archivePath "$archive_path" \
-  -exportPath "$output_dir" \
-  -exportOptionsPlist "$export_options" \
-  2>&1 | tee "$log_dir/xcodebuild-export.log"
-export_status=${PIPESTATUS[0]}
-set -e
-echo "::endgroup::"
+if [[ "$upload_testflight" == "true" ]]; then
+  python3 scripts/macos/set-build-number.py verify \
+    --archive "$archive_path" \
+    --build-number "$build_number"
+fi
 
-if (( export_status != 0 )); then
-  echo "::error title=IPA export failed::xcodebuild -exportArchive exited with status $export_status. See xcodebuild-export.log."
-  exit "$export_status"
+if [[ "$compliance_applies" == "true" ]]; then
+  python3 scripts/macos/configure-export-compliance.py verify \
+    --archive "$archive_path" \
+    --mode "$export_compliance" \
+    --compliance-code "$export_compliance_code"
+fi
+
+export_archive() {
+  local label="$1"
+  local slug="$2"
+  local map_path="$3"
+  local destination="$4"
+  local log_name="$5"
+  local suffix="$6"
+  local env_name="$7"
+  local export_options="$work_dir/ExportOptions-$slug.plist"
+
+  mkdir -p "$destination"
+  python3 scripts/macos/make-export-options.py "$map_path" "$export_options"
+  echo "::group::xcodebuild exportArchive ($label)"
+  set +e
+  NSUnbufferedIO=YES xcodebuild \
+    -exportArchive \
+    -archivePath "$archive_path" \
+    -exportPath "$destination" \
+    -exportOptionsPlist "$export_options" \
+    2>&1 | redact_export_compliance_code | tee "$log_dir/$log_name"
+  local export_status=${PIPESTATUS[0]}
+  set -e
+  echo "::endgroup::"
+
+  if (( export_status != 0 )); then
+    echo "::error title=IPA export failed::$label export exited with status $export_status. See $log_name."
+    exit "$export_status"
+  fi
+
+  local ipas=()
+  while IFS= read -r -d '' ipa; do
+    ipas+=("$ipa")
+  done < <(find "$destination" -type f -name '*.ipa' -print0)
+  if (( ${#ipas[@]} == 0 )); then
+    echo "::error title=IPA missing::$label export completed without producing an .ipa file."
+    exit 42
+  fi
+
+  if [[ -n "$suffix" ]]; then
+    local renamed=()
+    local target
+    for ipa in "${ipas[@]}"; do
+      target="${ipa%.ipa}-$suffix.ipa"
+      mv -- "$ipa" "$target"
+      renamed+=("$target")
+    done
+    ipas=("${renamed[@]}")
+  fi
+
+  if [[ -n "$env_name" ]]; then
+    if (( ${#ipas[@]} != 1 )); then
+      echo "::error title=Ambiguous IPA export::$label export produced ${#ipas[@]} IPA files; TestFlight mode requires exactly one."
+      exit 42
+    fi
+    if [[ -z "${GITHUB_ENV:-}" ]]; then
+      echo "::error title=GitHub environment unavailable::GITHUB_ENV is required for TestFlight mode."
+      exit 42
+    fi
+    printf '%s=%s\n' "$env_name" "${ipas[0]}" >> "$GITHUB_ENV"
+  fi
+}
+
+if [[ "$upload_testflight" == "true" ]]; then
+  adhoc_signing_map="${XBUILD_SIGNING_MAP_ADHOC:?XBUILD_SIGNING_MAP_ADHOC is required}"
+  appstore_signing_map="${XBUILD_SIGNING_MAP_APPSTORE:?XBUILD_SIGNING_MAP_APPSTORE is required}"
+  export_archive "Ad Hoc" "ad-hoc" "$adhoc_signing_map" "$output_dir/ad-hoc" "xcodebuild-export-ad-hoc.log" "AdHoc" "XBUILD_ADHOC_IPA"
+  export_archive "App Store" "app-store" "$appstore_signing_map" "$output_dir/app-store" "xcodebuild-export-app-store.log" "AppStore" "XBUILD_APPSTORE_IPA"
+else
+  export_archive "$XBUILD_EXPORT_METHOD" "single" "$signing_map" "$output_dir" "xcodebuild-export.log" "" ""
 fi
 
 ipa_count="$(find "$output_dir" -type f -name '*.ipa' -print | wc -l | tr -d ' ')"
-if [[ "$ipa_count" == "0" ]]; then
-  echo "::error title=IPA missing::Export completed without producing an .ipa file."
-  exit 42
-fi
 
 python3 - "$output_dir" "$signing_map" <<'PY'
 import hashlib
@@ -106,7 +233,7 @@ except Exception:
     xcode_version = "unknown"
 
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2 if os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true" else 1,
     "build_id": os.environ.get("XBUILD_BUILD_ID", ""),
     "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
     "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
@@ -116,7 +243,19 @@ manifest = {
     "scheme": os.environ.get("XBUILD_SCHEME", ""),
     "configuration": os.environ.get("XBUILD_CONFIGURATION", ""),
     "bundle_identifier": os.environ.get("XBUILD_BUNDLE_IDENTIFIER", ""),
-    "export_method": signing["export_method"],
+    "export_method": (
+        "ad-hoc+app-store"
+        if os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true"
+        else signing["export_method"]
+    ),
+    "build_number": os.environ.get("XBUILD_EFFECTIVE_BUILD_NUMBER", ""),
+    "testflight_requested": os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true",
+    "export_compliance": (
+        os.environ.get("XBUILD_EXPORT_COMPLIANCE", "preserve")
+        if os.environ.get("XBUILD_EXPORT_METHOD") == "app-store"
+        or os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true"
+        else "not-applicable"
+    ),
     "team_id": signing["team_id"],
     "xcode_version": xcode_version,
     "ipas": ipas,

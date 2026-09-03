@@ -113,7 +113,7 @@ project_paths.each do |project_path|
       settings['DEVELOPMENT_TEAM'] = team_id
       settings['CODE_SIGN_STYLE'] = 'Manual'
       settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = identity
-      settings['PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]'] = profile.fetch('name')
+      settings['PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]'] = profile.fetch('uuid')
       settings['PROVISIONING_PROFILE[sdk=iphoneos*]'] = profile.fetch('uuid')
       configured_bundle_ids << bundle_id
       project_changed = true

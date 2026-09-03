@@ -9,8 +9,9 @@ github_env_file="${2:?Usage: install-signing.sh <bundle-ids-file> <github-env-fi
 signing_dir="${XBUILD_SIGNING_DIR:?XBUILD_SIGNING_DIR is required}"
 export_method="${XBUILD_EXPORT_METHOD:?XBUILD_EXPORT_METHOD is required}"
 signing_set="${XBUILD_SIGNING_SET:-}"
+upload_testflight="${XBUILD_UPLOAD_TESTFLIGHT:-false}"
 
-mkdir -p "$signing_dir/raw-profiles" "$signing_dir/profile-metadata"
+mkdir -p "$signing_dir"
 
 case "$export_method" in
   development) mode_suffix="DEVELOPMENT" ;;
@@ -22,7 +23,40 @@ case "$export_method" in
     ;;
 esac
 
-if [[ -n "$signing_set" ]]; then
+if [[ "$upload_testflight" == "true" ]]; then
+  if [[ "$export_method" != "ad-hoc" ]]; then
+    echo "::error title=Invalid dual signing::TestFlight mode must use ad-hoc as the primary export method."
+    exit 32
+  fi
+  if [[ -z "$signing_set" || ! "$signing_set" =~ ^[A-Z0-9][A-Z0-9_]{0,31}$ ]]; then
+    echo "::error title=Named signing set required::TestFlight mode requires a valid named signing set."
+    exit 32
+  fi
+  secret_prefix="XBUILD_SIGNING_${signing_set}"
+  certificate_base64="${XBUILD_DUAL_ADHOC_CERTIFICATE_BASE64:-}"
+  certificate_password="${XBUILD_DUAL_ADHOC_CERTIFICATE_PASSWORD:-}"
+  profiles_base64="${XBUILD_DUAL_ADHOC_PROFILES_BASE64:-}"
+  appstore_certificate_base64="${XBUILD_DUAL_APPSTORE_CERTIFICATE_BASE64:-}"
+  appstore_certificate_password="${XBUILD_DUAL_APPSTORE_CERTIFICATE_PASSWORD:-}"
+  appstore_profiles_base64="${XBUILD_DUAL_APPSTORE_PROFILES_BASE64:-}"
+  team_id_override="${XBUILD_SET_TEAM_ID_OVERRIDE:-}"
+  certificate_hint="${secret_prefix}_CERTIFICATE_ADHOC_BASE64 and ${secret_prefix}_CERTIFICATE_APPSTORE_BASE64"
+  profiles_hint="${secret_prefix}_PROVISIONING_PROFILES_ADHOC_BASE64 and ${secret_prefix}_PROVISIONING_PROFILES_APPSTORE_BASE64"
+  if [[ -z "$appstore_certificate_base64" ]]; then
+    echo "::error title=App Store certificate missing::Configure $certificate_hint."
+    exit 32
+  fi
+  if [[ -z "$appstore_profiles_base64" ]]; then
+    echo "::error title=App Store profiles missing::Configure $profiles_hint."
+    exit 32
+  fi
+  if [[ "$certificate_base64" != "$appstore_certificate_base64" ||
+        "$certificate_password" != "$appstore_certificate_password" ]]; then
+    echo "::error title=Distribution certificate mismatch::Ad Hoc and App Store must use the same Distribution P12 and password for a one-archive build. Re-save this Apple Team in XBuild."
+    exit 32
+  fi
+  echo "Using named signing set '$signing_set' for Ad Hoc and App Store exports."
+elif [[ -n "$signing_set" ]]; then
   if [[ ! "$signing_set" =~ ^[A-Z0-9][A-Z0-9_]{0,31}$ ]]; then
     echo "::error title=Invalid signing set::Signing set keys must match [A-Z0-9][A-Z0-9_]{0,31}."
     exit 32
@@ -54,8 +88,19 @@ if [[ -z "$profiles_base64" ]]; then
   exit 32
 fi
 
+if [[ "$upload_testflight" == "true" ]]; then
+  mkdir -p "$signing_dir/raw-profiles-ad-hoc" "$signing_dir/profile-metadata-ad-hoc" "$signing_dir/raw-profiles-app-store" "$signing_dir/profile-metadata-app-store"
+  raw_profiles_dir="$signing_dir/raw-profiles-ad-hoc"
+  metadata_dir="$signing_dir/profile-metadata-ad-hoc"
+else
+  mkdir -p "$signing_dir/raw-profiles" "$signing_dir/profile-metadata"
+  raw_profiles_dir="$signing_dir/raw-profiles"
+  metadata_dir="$signing_dir/profile-metadata"
+fi
+
 certificate_path="$signing_dir/certificate.p12"
 profiles_blob="$signing_dir/profiles.payload"
+appstore_profiles_blob="$signing_dir/profiles-app-store.payload"
 
 # Decode with Python so both wrapped and unwrapped Base64 produced by Windows
 # setup tools are accepted without writing a secret to the command line.
@@ -73,7 +118,10 @@ except Exception as exc:
 pathlib.Path(os.environ["XBUILD_DECODE_PATH"]).write_bytes(payload)
 PY
 
-XBUILD_DECODE_VALUE="$profiles_base64" XBUILD_DECODE_PATH="$profiles_blob" python3 - <<'PY'
+decode_profile_payload() {
+  local encoded="$1"
+  local destination="$2"
+  XBUILD_DECODE_VALUE="$encoded" XBUILD_DECODE_PATH="$destination" python3 - <<'PY'
 import base64
 import os
 import pathlib
@@ -86,10 +134,14 @@ except Exception as exc:
     raise SystemExit(32)
 pathlib.Path(os.environ["XBUILD_DECODE_PATH"]).write_bytes(payload)
 PY
+}
 
-# The plural secret is normally a ZIP, while all singular/fallback secrets may
-# be a raw .mobileprovision. Extract only provisioning-profile entries.
-python3 - "$profiles_blob" "$signing_dir/raw-profiles" <<'PY'
+# The plural secret is normally a ZIP, while singular secrets may be a raw
+# .mobileprovision. Extract only provisioning-profile entries.
+extract_profiles() {
+  local payload="$1"
+  local destination="$2"
+  python3 - "$payload" "$destination" <<'PY'
 import pathlib
 import shutil
 import sys
@@ -112,27 +164,66 @@ if zipfile.is_zipfile(source):
 else:
     shutil.copyfile(source, destination / "001.mobileprovision")
 PY
+}
 
-decoded_count=0
-while IFS= read -r -d '' profile; do
-  decoded_count=$((decoded_count + 1))
-  stem="$(basename "$profile" .mobileprovision)"
-  if ! security cms -D -i "$profile" > "$signing_dir/profile-metadata/$stem.plist"; then
-    echo "::error title=Invalid provisioning profile::Could not decode provisioning profile number $decoded_count."
+decode_profile_metadata() {
+  local raw_directory="$1"
+  local metadata_directory="$2"
+  local decoded_count=0
+  while IFS= read -r -d '' profile; do
+    decoded_count=$((decoded_count + 1))
+    stem="$(basename "$profile" .mobileprovision)"
+    if ! security cms -D -i "$profile" > "$metadata_directory/$stem.plist"; then
+      echo "::error title=Invalid provisioning profile::Could not decode provisioning profile number $decoded_count."
+      return 33
+    fi
+  done < <(find "$raw_directory" -type f -name '*.mobileprovision' -print0)
+}
+
+decode_profile_payload "$profiles_base64" "$profiles_blob"
+extract_profiles "$profiles_blob" "$raw_profiles_dir"
+decode_profile_metadata "$raw_profiles_dir" "$metadata_dir"
+
+if [[ "$upload_testflight" == "true" ]]; then
+  decode_profile_payload "$appstore_profiles_base64" "$appstore_profiles_blob"
+  extract_profiles "$appstore_profiles_blob" "$signing_dir/raw-profiles-app-store"
+  decode_profile_metadata "$signing_dir/raw-profiles-app-store" "$signing_dir/profile-metadata-app-store"
+
+  adhoc_signing_map="$signing_dir/signing-map-ad-hoc.json"
+  appstore_signing_map="$signing_dir/signing-map-app-store.json"
+  python3 scripts/macos/select-signing.py \
+    --metadata-dir "$metadata_dir" \
+    --raw-dir "$raw_profiles_dir" \
+    --bundle-ids "$bundle_ids_file" \
+    --method ad-hoc \
+    --team-id "$team_id_override" \
+    --output "$adhoc_signing_map"
+  python3 scripts/macos/select-signing.py \
+    --metadata-dir "$signing_dir/profile-metadata-app-store" \
+    --raw-dir "$signing_dir/raw-profiles-app-store" \
+    --bundle-ids "$bundle_ids_file" \
+    --method app-store \
+    --team-id "$team_id_override" \
+    --output "$appstore_signing_map"
+  adhoc_team_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["team_id"])' "$adhoc_signing_map")"
+  appstore_team_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["team_id"])' "$appstore_signing_map")"
+  if [[ "$adhoc_team_id" != "$appstore_team_id" ]]; then
+    echo "::error title=Signing team mismatch::Ad Hoc team $adhoc_team_id does not match App Store team $appstore_team_id."
     exit 33
   fi
-done < <(find "$signing_dir/raw-profiles" -type f -name '*.mobileprovision' -print0)
-
-signing_map="$signing_dir/signing-map.json"
-python3 scripts/macos/select-signing.py \
-  --metadata-dir "$signing_dir/profile-metadata" \
-  --raw-dir "$signing_dir/raw-profiles" \
-  --bundle-ids "$bundle_ids_file" \
-  --method "$export_method" \
-  --team-id "$team_id_override" \
-  --output "$signing_map"
-
-team_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["team_id"])' "$signing_map")"
+  signing_map="$appstore_signing_map"
+  team_id="$appstore_team_id"
+else
+  signing_map="$signing_dir/signing-map.json"
+  python3 scripts/macos/select-signing.py \
+    --metadata-dir "$metadata_dir" \
+    --raw-dir "$raw_profiles_dir" \
+    --bundle-ids "$bundle_ids_file" \
+    --method "$export_method" \
+    --team-id "$team_id_override" \
+    --output "$signing_map"
+  team_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["team_id"])' "$signing_map")"
+fi
 keychain_path="$signing_dir/xbuild.keychain-db"
 keychain_password="$(openssl rand -base64 36 | tr -d '\r\n')"
 original_keychains="$signing_dir/original-keychains.txt"
@@ -167,31 +258,39 @@ if ! certificate_identity="$(xbuild_select_signing_identity "$export_method" "$i
   exit 34
 fi
 
-python3 - "$signing_map" "$certificate_identity" <<'PY'
+maps_to_install=("$signing_map")
+if [[ "$upload_testflight" == "true" ]]; then
+  maps_to_install=("$adhoc_signing_map" "$appstore_signing_map")
+fi
+
+python3 - "$certificate_identity" "${maps_to_install[@]}" <<'PY'
 import json
 import pathlib
 import sys
 
-path = pathlib.Path(sys.argv[1])
-data = json.loads(path.read_text(encoding="utf-8"))
-data["certificate_identity"] = sys.argv[2]
-path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+identity = sys.argv[1]
+for argument in sys.argv[2:]:
+    path = pathlib.Path(argument)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["certificate_identity"] = identity
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 
 legacy_profiles_home="$HOME/Library/MobileDevice/Provisioning Profiles"
 xcode_profiles_home="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
 mkdir -p "$legacy_profiles_home" "$xcode_profiles_home"
 installed_manifest="$signing_dir/installed-profiles.txt"
-python3 - "$signing_map" <<'PY' | while IFS=$'\t' read -r uuid raw_path; do
+python3 - "${maps_to_install[@]}" <<'PY' | while IFS=$'\t' read -r uuid raw_path; do
 import json
 import sys
 
-data = json.load(open(sys.argv[1], encoding="utf-8"))
 seen = set()
-for profile in data["profiles"].values():
-    if profile["uuid"] not in seen:
-        seen.add(profile["uuid"])
-        print(f"{profile['uuid']}\t{profile['raw_path']}")
+for argument in sys.argv[1:]:
+    data = json.load(open(argument, encoding="utf-8"))
+    for profile in data["profiles"].values():
+        if profile["uuid"] not in seen:
+            seen.add(profile["uuid"])
+            print(f"{profile['uuid']}\t{profile['raw_path']}")
 PY
   # Xcode 16+ manages profiles under UserData, while older Xcode releases and
   # some command-line tooling still discover the legacy MobileDevice cache.
@@ -205,14 +304,24 @@ done
 
 printf 'XBUILD_KEYCHAIN_PATH=%s\n' "$keychain_path" >> "$github_env_file"
 printf 'XBUILD_SIGNING_MAP=%s\n' "$signing_map" >> "$github_env_file"
+if [[ "$upload_testflight" == "true" ]]; then
+  printf 'XBUILD_SIGNING_MAP_ADHOC=%s\n' "$adhoc_signing_map" >> "$github_env_file"
+  printf 'XBUILD_SIGNING_MAP_APPSTORE=%s\n' "$appstore_signing_map" >> "$github_env_file"
+fi
 printf 'XBUILD_TEAM_ID=%s\n' "$team_id" >> "$github_env_file"
 printf 'XBUILD_CERTIFICATE_IDENTITY=%s\n' "$certificate_identity" >> "$github_env_file"
 
 # The imported identity and installed profiles are all Xcode needs. Delete the
 # decoded P12, its password-independent payload, and duplicate profile copies
 # before any project-provided build phase can run.
-rm -f -- "$certificate_path" "$profiles_blob"
-rm -rf -- "$signing_dir/raw-profiles" "$signing_dir/profile-metadata"
+rm -f -- "$certificate_path" "$profiles_blob" "$appstore_profiles_blob"
+rm -rf -- \
+  "$signing_dir/raw-profiles" \
+  "$signing_dir/profile-metadata" \
+  "$signing_dir/raw-profiles-ad-hoc" \
+  "$signing_dir/profile-metadata-ad-hoc" \
+  "$signing_dir/raw-profiles-app-store" \
+  "$signing_dir/profile-metadata-app-store"
 
 echo "Imported signing identity: $certificate_identity"
 echo "Installed provisioning profiles for team $team_id."
@@ -227,4 +336,8 @@ unset XBUILD_SET_MODE_CERTIFICATE_BASE64 XBUILD_SET_MODE_CERTIFICATE_PASSWORD
 unset XBUILD_SET_MODE_PROFILES_BASE64 XBUILD_SET_MODE_PROFILE_BASE64
 unset XBUILD_SET_COMMON_CERTIFICATE_BASE64 XBUILD_SET_COMMON_CERTIFICATE_PASSWORD
 unset XBUILD_SET_COMMON_PROFILES_BASE64 XBUILD_SET_COMMON_PROFILE_BASE64
+unset XBUILD_DUAL_ADHOC_CERTIFICATE_BASE64 XBUILD_DUAL_ADHOC_CERTIFICATE_PASSWORD
+unset XBUILD_DUAL_ADHOC_PROFILES_BASE64
+unset XBUILD_DUAL_APPSTORE_CERTIFICATE_BASE64 XBUILD_DUAL_APPSTORE_CERTIFICATE_PASSWORD
+unset XBUILD_DUAL_APPSTORE_PROFILES_BASE64
 unset XBUILD_SET_TEAM_ID_OVERRIDE XBUILD_LEGACY_TEAM_ID_OVERRIDE XBUILD_TEAM_ID_OVERRIDE
