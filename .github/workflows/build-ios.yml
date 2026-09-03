@@ -1,16 +1,24 @@
 name: Build Unity iOS
 
-run-name: xbuild • ${{ inputs.build_id }} • ${{ inputs.upload_testflight && 'ad-hoc+testflight' || inputs.export_method }}
+run-name: xbuild • ${{ inputs.build_id }} • ${{ inputs.operation }}
 
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: Build IPA files or upload a previously built App Store IPA
+        required: true
+        default: build
+        type: choice
+        options:
+          - build
+          - upload-testflight
       build_id:
         description: Unique desktop build ID used to correlate the dispatched run
         required: true
         type: string
       upload_release_tag:
-        description: Draft release tag containing the uploaded Xcode project archive
+        description: Draft release tag containing the uploaded Xcode archive or App Store IPA
         required: true
         type: string
       upload_release_id:
@@ -18,7 +26,7 @@ on:
         required: true
         type: string
       upload_asset_name:
-        description: Exact ZIP asset name in the draft release
+        description: Exact uploaded asset name in the draft release
         required: true
         type: string
       upload_asset_id:
@@ -27,7 +35,7 @@ on:
         default: ""
         type: string
       archive_sha256:
-        description: SHA-256 of the uploaded ZIP
+        description: SHA-256 of the uploaded Xcode ZIP or App Store IPA
         required: true
         type: string
       export_method:
@@ -40,7 +48,12 @@ on:
           - ad-hoc
           - app-store
       upload_testflight:
-        description: Also export App Store and upload it to TestFlight from the same archive
+        description: Deprecated compatibility flag; exports App Store IPA but never uploads automatically
+        required: true
+        default: false
+        type: boolean
+      export_app_store:
+        description: Also export an App Store IPA for a later explicit TestFlight upload
         required: true
         default: false
         type: boolean
@@ -100,13 +113,14 @@ concurrency:
 jobs:
   build-ios:
     name: Build IPA on macOS
+    if: ${{ inputs.operation == 'build' }}
     runs-on: ${{ vars.XBUILD_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 120
     env:
       XBUILD_BUILD_ID: ${{ inputs.build_id }}
       XBUILD_SOURCE_SHA256: ${{ inputs.archive_sha256 }}
       XBUILD_EXPORT_METHOD: ${{ inputs.export_method }}
-      XBUILD_UPLOAD_TESTFLIGHT: ${{ inputs.upload_testflight }}
+      XBUILD_EXPORT_APPSTORE: ${{ inputs.export_app_store || inputs.upload_testflight }}
       XBUILD_EXPORT_COMPLIANCE: ${{ inputs.export_compliance }}
       XBUILD_EXPORT_COMPLIANCE_CODE: ${{ inputs.export_compliance_code }}
       XBUILD_REQUESTED_SCHEME: ${{ inputs.scheme }}
@@ -141,6 +155,7 @@ jobs:
       - name: Check out trusted build scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Select and show macOS build toolchain
@@ -172,7 +187,7 @@ jobs:
           pod --version || echo "CocoaPods is not preinstalled; it will be installed if a Podfile is found."
 
           xcode_major="$(xcodebuild -version | awk '/^Xcode / { split($2, version, "."); print version[1]; exit }')"
-          if [[ "$XBUILD_EXPORT_METHOD" == "app-store" || "$XBUILD_UPLOAD_TESTFLIGHT" == "true" ]] &&
+          if [[ "$XBUILD_EXPORT_METHOD" == "app-store" || "$XBUILD_EXPORT_APPSTORE" == "true" ]] &&
              { [[ ! "$xcode_major" =~ ^[0-9]+$ ]] || (( xcode_major < 26 )); }; then
             echo "::error title=Xcode 26 required::App Store Connect uploads have required Xcode 26 or newer since April 28, 2026. Select a compatible runner/Xcode using XBUILD_MACOS_RUNNER and XBUILD_XCODE_PATH."
             exit 2
@@ -230,12 +245,12 @@ jobs:
               exit 2
               ;;
           esac
-          if [[ "$XBUILD_UPLOAD_TESTFLIGHT" != "true" && "$XBUILD_UPLOAD_TESTFLIGHT" != "false" ]]; then
-            echo "::error title=Invalid TestFlight option::upload_testflight must be true or false."
+          if [[ "$XBUILD_EXPORT_APPSTORE" != "true" && "$XBUILD_EXPORT_APPSTORE" != "false" ]]; then
+            echo "::error title=Invalid App Store export option::export_app_store must be true or false."
             exit 2
           fi
-          if [[ "$XBUILD_UPLOAD_TESTFLIGHT" == "true" && "$XBUILD_EXPORT_METHOD" != "ad-hoc" ]]; then
-            echo "::error title=Invalid dual export::TestFlight upload mode must use ad-hoc as its primary export method."
+          if [[ "$XBUILD_EXPORT_APPSTORE" == "true" && "$XBUILD_EXPORT_METHOD" != "ad-hoc" ]]; then
+            echo "::error title=Invalid dual export::Deferred App Store export must use ad-hoc as its primary export method."
             exit 2
           fi
           case "$XBUILD_EXPORT_COMPLIANCE" in
@@ -250,7 +265,7 @@ jobs:
             echo "::error title=Invalid export compliance code::The value must be at most 256 characters and contain no control characters."
             exit 2
           fi
-          if { [[ "$XBUILD_EXPORT_METHOD" == "app-store" ]] || [[ "$XBUILD_UPLOAD_TESTFLIGHT" == "true" ]]; } &&
+          if { [[ "$XBUILD_EXPORT_METHOD" == "app-store" ]] || [[ "$XBUILD_EXPORT_APPSTORE" == "true" ]]; } &&
              [[ "$XBUILD_EXPORT_COMPLIANCE" == "non-exempt" ]] &&
              [[ -z "${XBUILD_EXPORT_COMPLIANCE_CODE//[[:space:]]/}" ]]; then
             echo "::error title=Export compliance code required::Non-exempt encryption requires the code Apple provided after approving the app's export documentation."
@@ -261,8 +276,8 @@ jobs:
             exit 2
           fi
 
-      - name: Preflight TestFlight credentials
-        if: ${{ inputs.upload_testflight }}
+      - name: Preflight dual-export signing material
+        if: ${{ inputs.export_app_store || inputs.upload_testflight }}
         shell: bash
         env:
           ADHOC_CERTIFICATE_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_ADHOC_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_BASE64', inputs.signing_set)] }}
@@ -272,17 +287,11 @@ jobs:
           APPSTORE_CERTIFICATE_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_APPSTORE_PASSWORD', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_PASSWORD', inputs.signing_set)] }}
           APPSTORE_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_APPSTORE_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_APPSTORE_BASE64', inputs.signing_set)] }}
           SIGNING_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
-          TESTFLIGHT_AUTH_METHOD: ${{ secrets[format('XBUILD_SIGNING_{0}_TESTFLIGHT_AUTH_METHOD', inputs.signing_set)] }}
-          ASC_KEY_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] != '' }}
-          ASC_ISSUER_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] != '' }}
-          ASC_PRIVATE_KEY_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] != '' }}
-          APPLE_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] != '' }}
-          APP_SPECIFIC_PASSWORD_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] != '' }}
         run: |
           set -euo pipefail
           umask 077
           if [[ -z "$XBUILD_SIGNING_SET" ]]; then
-            echo "::error title=Named signing set required::TestFlight mode requires an Apple Team selected in XBuild."
+            echo "::error title=Named signing set required::Dual Ad Hoc and App Store export requires an Apple Team selected in XBuild."
             exit 2
           fi
           missing=()
@@ -291,37 +300,8 @@ jobs:
           [[ -z "$APPSTORE_CERTIFICATE_BASE64" ]] && missing+=("App Store distribution certificate")
           [[ -z "$APPSTORE_PROFILES_BASE64" ]] && missing+=("App Store provisioning profiles")
           [[ -z "$SIGNING_TEAM_ID" ]] && missing+=("Apple Team ID")
-          selected_auth="$TESTFLIGHT_AUTH_METHOD"
-          if [[ -z "$selected_auth" ]]; then
-            if [[ "$ASC_KEY_ID_CONFIGURED" == "true" &&
-                  "$ASC_ISSUER_ID_CONFIGURED" == "true" &&
-                  "$ASC_PRIVATE_KEY_CONFIGURED" == "true" ]]; then
-              selected_auth="api-key"
-            elif [[ "$APPLE_ID_CONFIGURED" == "true" &&
-                    "$APP_SPECIFIC_PASSWORD_CONFIGURED" == "true" ]]; then
-              selected_auth="apple-id"
-            fi
-          fi
-          case "$selected_auth" in
-            api-key)
-              [[ "$ASC_KEY_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Key ID")
-              [[ "$ASC_ISSUER_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Issuer ID")
-              [[ "$ASC_PRIVATE_KEY_CONFIGURED" != "true" ]] && missing+=("App Store Connect private key")
-              ;;
-            apple-id)
-              [[ "$APPLE_ID_CONFIGURED" != "true" ]] && missing+=("Apple ID")
-              [[ "$APP_SPECIFIC_PASSWORD_CONFIGURED" != "true" ]] && missing+=("Apple app-specific password")
-              ;;
-            "")
-              missing+=("TestFlight authentication (API key or Apple ID + app-specific password)")
-              ;;
-            *)
-              echo "::error title=Invalid TestFlight authentication::TESTFLIGHT_AUTH_METHOD must be api-key or apple-id. Re-save this Apple Team in XBuild."
-              exit 2
-              ;;
-          esac
           if (( ${#missing[@]} > 0 )); then
-            printf '::error title=TestFlight setup incomplete::Missing: %s.\n' "$(IFS=', '; echo "${missing[*]}")"
+            printf '::error title=Dual export setup incomplete::Missing: %s.\n' "$(IFS=', '; echo "${missing[*]}")"
             exit 2
           fi
           if [[ "$ADHOC_CERTIFICATE_BASE64" != "$APPSTORE_CERTIFICATE_BASE64" ||
@@ -337,7 +317,7 @@ jobs:
             echo "::error title=Apple Team mismatch::The selected Team ID does not match the Team ID stored in its GitHub secret namespace."
             exit 2
           fi
-          echo "TestFlight authentication preflight passed using $selected_auth."
+          echo "Dual Ad Hoc and App Store signing preflight passed."
 
       - name: Download uploaded Xcode project
         shell: bash
@@ -402,9 +382,34 @@ jobs:
         shell: bash
         run: bash scripts/macos/install-cocoapods.sh "$XBUILD_SOURCE_DIR" "$XBUILD_LOG_DIR" "$XBUILD_PROJECT_HINT"
 
+      # Podfiles are executable Ruby and may run hooks. Restore the repository
+      # checkout before any signing secret is materialized so an uploaded
+      # project cannot persist a replacement for XBuild's trusted scripts.
+      - name: Restore trusted build scripts after CocoaPods
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Detect Xcode container, scheme, configuration, and bundle ID
         shell: bash
         run: bash scripts/macos/detect-xcode.sh "$XBUILD_SOURCE_DIR" "$GITHUB_ENV" "$XBUILD_WORK_DIR"
+
+      - name: Verify trusted signing scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "::error title=Trusted checkout mismatch::The restored script checkout is not the workflow commit."
+            exit 2
+          fi
+          if [[ -n "$(git status --porcelain=v1 --untracked-files=all -- scripts/macos)" ]]; then
+            echo "::error title=Trusted scripts modified::A macOS build script changed after the trusted checkout was restored."
+            exit 2
+          fi
+          echo "Trusted macOS scripts match $GITHUB_SHA."
 
       - name: Install signing certificate and provisioning profiles
         shell: bash
@@ -425,8 +430,8 @@ jobs:
           XBUILD_SET_COMMON_PROFILE_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILE_BASE64', inputs.signing_set)] }}
           XBUILD_SET_TEAM_ID_OVERRIDE: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
 
-          # TestFlight mode needs both distribution profile classes. The desktop
-          # setup writes the same Distribution P12 for both modes.
+          # A deferred TestFlight build exports both distribution profile classes.
+          # The desktop setup writes the same Distribution P12 for both modes.
           XBUILD_DUAL_ADHOC_CERTIFICATE_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_ADHOC_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_BASE64', inputs.signing_set)] }}
           XBUILD_DUAL_ADHOC_CERTIFICATE_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_ADHOC_PASSWORD', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_CERTIFICATE_PASSWORD', inputs.signing_set)] }}
           XBUILD_DUAL_ADHOC_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_ADHOC_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_ADHOC_BASE64', inputs.signing_set)] }}
@@ -439,18 +444,18 @@ jobs:
           # Mode-specific credentials take precedence. Common credentials keep the
           # one-time setup small when the same certificate is usable for all modes.
           XBUILD_MODE_CERTIFICATE_BASE64: >-
-            ${{ inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_BASE64 || '' }}
+            ${{ inputs.signing_set == '' && (inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_BASE64) || '' }}
           XBUILD_MODE_CERTIFICATE_PASSWORD: >-
-            ${{ inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_PASSWORD || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_PASSWORD || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_PASSWORD || '' }}
+            ${{ inputs.signing_set == '' && (inputs.export_method == 'development' && secrets.IOS_CERTIFICATE_DEVELOPMENT_PASSWORD || inputs.export_method == 'ad-hoc' && secrets.IOS_CERTIFICATE_ADHOC_PASSWORD || inputs.export_method == 'app-store' && secrets.IOS_CERTIFICATE_APPSTORE_PASSWORD) || '' }}
           XBUILD_MODE_PROFILES_BASE64: >-
-            ${{ inputs.export_method == 'development' && secrets.IOS_PROVISIONING_PROFILES_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROVISIONING_PROFILES_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROVISIONING_PROFILES_APPSTORE_BASE64 || '' }}
+            ${{ inputs.signing_set == '' && (inputs.export_method == 'development' && secrets.IOS_PROVISIONING_PROFILES_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROVISIONING_PROFILES_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROVISIONING_PROFILES_APPSTORE_BASE64) || '' }}
           XBUILD_MODE_PROFILE_BASE64: >-
-            ${{ inputs.export_method == 'development' && secrets.IOS_PROFILE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROFILE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROFILE_APPSTORE_BASE64 || '' }}
-          XBUILD_COMMON_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
-          XBUILD_COMMON_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-          XBUILD_COMMON_PROFILES_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILES_BASE64 }}
-          XBUILD_COMMON_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-          XBUILD_LEGACY_TEAM_ID_OVERRIDE: ${{ secrets.APPLE_TEAM_ID }}
+            ${{ inputs.signing_set == '' && (inputs.export_method == 'development' && secrets.IOS_PROFILE_DEVELOPMENT_BASE64 || inputs.export_method == 'ad-hoc' && secrets.IOS_PROFILE_ADHOC_BASE64 || inputs.export_method == 'app-store' && secrets.IOS_PROFILE_APPSTORE_BASE64) || '' }}
+          XBUILD_COMMON_CERTIFICATE_BASE64: ${{ inputs.signing_set == '' && secrets.IOS_CERTIFICATE_BASE64 || '' }}
+          XBUILD_COMMON_CERTIFICATE_PASSWORD: ${{ inputs.signing_set == '' && secrets.IOS_CERTIFICATE_PASSWORD || '' }}
+          XBUILD_COMMON_PROFILES_BASE64: ${{ inputs.signing_set == '' && secrets.IOS_PROVISIONING_PROFILES_BASE64 || '' }}
+          XBUILD_COMMON_PROFILE_BASE64: ${{ inputs.signing_set == '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
+          XBUILD_LEGACY_TEAM_ID_OVERRIDE: ${{ inputs.signing_set == '' && secrets.APPLE_TEAM_ID || '' }}
         run: bash scripts/macos/install-signing.sh "$XBUILD_BUNDLE_IDS_FILE" "$GITHUB_ENV"
 
       - name: Configure Xcode targets for manual signing
@@ -532,14 +537,16 @@ jobs:
           esac
 
   upload-testflight:
-    name: Upload App Store IPA to TestFlight
-    if: ${{ inputs.upload_testflight && needs.build-ios.result == 'success' }}
-    needs: build-ios
+    name: Upload existing App Store IPA to TestFlight
+    if: ${{ inputs.operation == 'upload-testflight' }}
     runs-on: ${{ vars.XBUILD_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 30
     permissions:
       actions: read
-      contents: read
+      contents: write
+    env:
+      XBUILD_SIGNING_SET: ${{ inputs.signing_set }}
+      XBUILD_XCODE_PATH: ${{ vars.XBUILD_XCODE_PATH }}
     steps:
       - name: Initialize isolated upload workspace
         shell: bash
@@ -547,49 +554,224 @@ jobs:
           set -euo pipefail
           umask 077
           work_dir="${RUNNER_TEMP%/}/xbuild-testflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          artifact_dir="$work_dir/artifact"
+          output_dir="$work_dir/output"
           log_dir="$work_dir/logs"
           signing_dir="$work_dir/signing"
           {
             printf 'XBUILD_TESTFLIGHT_WORK_DIR=%s\n' "$work_dir"
-            printf 'XBUILD_OUTPUT_DIR=%s\n' "$artifact_dir"
+            printf 'XBUILD_OUTPUT_DIR=%s\n' "$output_dir"
             printf 'XBUILD_LOG_DIR=%s\n' "$log_dir"
             printf 'XBUILD_SIGNING_DIR=%s\n' "$signing_dir"
           } >> "$GITHUB_ENV"
-          mkdir -p -- "$artifact_dir" "$log_dir" "$signing_dir"
+          mkdir -p -- "$output_dir" "$log_dir" "$signing_dir"
+          printf 'XBuild deferred TestFlight run %s initialized.\n' "$GITHUB_RUN_ID" > "$log_dir/xbuild-testflight-run.txt"
 
       - name: Check out trusted upload script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Download exported IPA artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ios-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.XBUILD_OUTPUT_DIR }}
+      - name: Select and validate TestFlight upload toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${XBUILD_XCODE_PATH:-}" ]]; then
+            developer_dir="${XBUILD_XCODE_PATH%/}"
+            if [[ "$developer_dir" == *.app ]]; then
+              developer_dir="$developer_dir/Contents/Developer"
+            fi
+            case "$developer_dir" in
+              /Applications/Xcode*.app/Contents/Developer) ;;
+              *)
+                echo "::error title=Invalid Xcode path::XBUILD_XCODE_PATH must point to an Xcode app under /Applications."
+                exit 2
+                ;;
+            esac
+            if [[ ! -d "$developer_dir" ]]; then
+              echo "::error title=Xcode not found::$developer_dir does not exist on this runner image."
+              exit 2
+            fi
+            sudo xcode-select --switch "$developer_dir"
+          fi
+          xcodebuild -version
+          xcode_major="$(xcodebuild -version | awk '/^Xcode / { split($2, version, "."); print version[1]; exit }')"
+          if [[ ! "$xcode_major" =~ ^[0-9]+$ ]] || (( xcode_major < 26 )); then
+            echo "::error title=Xcode 26 required::App Store Connect uploads require Xcode 26 or newer. Select a compatible runner/Xcode using XBUILD_MACOS_RUNNER and XBUILD_XCODE_PATH."
+            exit 2
+          fi
 
-      - name: Upload App Store IPA
+      - name: Validate deferred TestFlight request
         shell: bash
         env:
-          XBUILD_TESTFLIGHT_AUTH_METHOD: ${{ secrets[format('XBUILD_SIGNING_{0}_TESTFLIGHT_AUTH_METHOD', inputs.signing_set)] }}
+          BUILD_ID: ${{ inputs.build_id }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+          UPLOAD_ASSET_NAME: ${{ inputs.upload_asset_name }}
+          UPLOAD_ASSET_ID: ${{ inputs.upload_asset_id }}
+          IPA_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BUILD_ID" || "$BUILD_ID" == *$'\n'* || "$BUILD_ID" == *$'\r'* ]]; then
+            echo "::error title=Invalid upload ID::build_id must be a non-empty, single-line value."
+            exit 2
+          fi
+          if [[ ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
+            echo "::error title=Invalid upload tag::upload_release_tag must begin with 'xbuild-upload-' and contain only safe tag characters."
+            exit 2
+          fi
+          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid upload release ID::upload_release_id must contain digits only."
+            exit 2
+          fi
+          if [[ -z "$UPLOAD_ASSET_NAME" || "$UPLOAD_ASSET_NAME" == */* || "$UPLOAD_ASSET_NAME" == *\\* || "$UPLOAD_ASSET_NAME" == *$'\n'* || "$UPLOAD_ASSET_NAME" == *$'\r'* ]]; then
+            echo "::error title=Invalid IPA asset::upload_asset_name must be a simple file name."
+            exit 2
+          fi
+          lower_asset_name="$(printf '%s' "$UPLOAD_ASSET_NAME" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$lower_asset_name" != *.ipa ]]; then
+            echo "::error title=Invalid IPA asset::upload_asset_name must end in .ipa."
+            exit 2
+          fi
+          if [[ ! "$UPLOAD_ASSET_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Invalid upload asset ID::upload_asset_id is required and must contain digits only."
+            exit 2
+          fi
+          if [[ ! "$IPA_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error title=Invalid IPA checksum::archive_sha256 must be a 64-character SHA-256 value."
+            exit 2
+          fi
+          if [[ -z "$XBUILD_SIGNING_SET" || ! "$XBUILD_SIGNING_SET" =~ ^[A-Z0-9][A-Z0-9_]{0,31}$ ]]; then
+            echo "::error title=Named signing set required::Select a valid Apple Team in XBuild before uploading to TestFlight."
+            exit 2
+          fi
+
+      - name: Download exact App Store IPA upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+          UPLOAD_ASSET_NAME: ${{ inputs.upload_asset_name }}
+          UPLOAD_ASSET_ID: ${{ inputs.upload_asset_id }}
+          IPA_SHA256: ${{ inputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          release_json="$XBUILD_TESTFLIGHT_WORK_DIR/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json"
+          actual_tag="$(jq -r '.tag_name' "$release_json")"
+          is_draft="$(jq -r '.draft' "$release_json")"
+          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
+            echo "::error title=Upload release mismatch::Release ID $UPLOAD_RELEASE_ID must be the draft release tagged '$UPLOAD_RELEASE_TAG'."
+            exit 3
+          fi
+          actual_name="$(jq -r --arg id "$UPLOAD_ASSET_ID" '.assets[] | select((.id | tostring) == $id) | .name' "$release_json" | head -n 1)"
+          if [[ -z "$actual_name" ]]; then
+            echo "::error title=IPA upload mismatch::Asset ID $UPLOAD_ASSET_ID does not belong to release ID $UPLOAD_RELEASE_ID."
+            exit 3
+          fi
+          if [[ "$actual_name" != "$UPLOAD_ASSET_NAME" ]]; then
+            echo "::error title=IPA upload mismatch::Asset ID $UPLOAD_ASSET_ID is named '$actual_name', not '$UPLOAD_ASSET_NAME'."
+            exit 3
+          fi
+          ipa_path="$XBUILD_OUTPUT_DIR/$UPLOAD_ASSET_NAME"
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$UPLOAD_ASSET_ID" > "$ipa_path"
+          if [[ ! -s "$ipa_path" ]]; then
+            echo "::error title=Empty IPA upload::The downloaded App Store IPA is empty."
+            exit 3
+          fi
+          actual_sha256="$(shasum -a 256 "$ipa_path" | awk '{print tolower($1)}')"
+          expected_sha256="$(printf '%s' "$IPA_SHA256" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+            echo "::error title=IPA checksum mismatch::Expected $expected_sha256 but downloaded $actual_sha256."
+            exit 3
+          fi
+          if ! unzip -tqq "$ipa_path"; then
+            echo "::error title=Invalid IPA archive::The uploaded file is not a readable IPA ZIP archive."
+            exit 3
+          fi
+          echo "Downloaded and verified $(du -h "$ipa_path" | awk '{print $1}') App Store IPA."
+          printf 'XBUILD_TESTFLIGHT_IPA=%s\n' "$ipa_path" >> "$GITHUB_ENV"
+
+      - name: Preflight TestFlight credentials
+        id: testflight_auth
+        shell: bash
+        env:
+          SIGNING_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
+          TESTFLIGHT_AUTH_METHOD: ${{ secrets[format('XBUILD_SIGNING_{0}_TESTFLIGHT_AUTH_METHOD', inputs.signing_set)] }}
+          ASC_KEY_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] != '' }}
+          ASC_ISSUER_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] != '' }}
+          ASC_PRIVATE_KEY_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] != '' }}
+          APPLE_ID_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] != '' }}
+          APP_SPECIFIC_PASSWORD_CONFIGURED: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] != '' }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -z "$SIGNING_TEAM_ID" ]] && missing+=("Apple Team ID")
+          selected_auth="$TESTFLIGHT_AUTH_METHOD"
+          if [[ -z "$selected_auth" ]]; then
+            if [[ "$ASC_KEY_ID_CONFIGURED" == "true" &&
+                  "$ASC_ISSUER_ID_CONFIGURED" == "true" &&
+                  "$ASC_PRIVATE_KEY_CONFIGURED" == "true" ]]; then
+              selected_auth="api-key"
+            elif [[ "$APPLE_ID_CONFIGURED" == "true" &&
+                    "$APP_SPECIFIC_PASSWORD_CONFIGURED" == "true" ]]; then
+              selected_auth="apple-id"
+            fi
+          fi
+          case "$selected_auth" in
+            api-key)
+              [[ "$ASC_KEY_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Key ID")
+              [[ "$ASC_ISSUER_ID_CONFIGURED" != "true" ]] && missing+=("App Store Connect Issuer ID")
+              [[ "$ASC_PRIVATE_KEY_CONFIGURED" != "true" ]] && missing+=("App Store Connect private key")
+              ;;
+            apple-id)
+              [[ "$APPLE_ID_CONFIGURED" != "true" ]] && missing+=("Apple ID")
+              [[ "$APP_SPECIFIC_PASSWORD_CONFIGURED" != "true" ]] && missing+=("Apple app-specific password")
+              ;;
+            "")
+              missing+=("TestFlight authentication (API key or Apple ID + app-specific password)")
+              ;;
+            *)
+              echo "::error title=Invalid TestFlight authentication::TESTFLIGHT_AUTH_METHOD must be api-key or apple-id. Re-save this Apple Team in XBuild."
+              exit 2
+              ;;
+          esac
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error title=TestFlight setup incomplete::Missing: %s.\n' "$(IFS=', '; echo "${missing[*]}")"
+            exit 2
+          fi
+          if [[ ! "$SIGNING_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "::error title=Invalid Apple Team ID::Expected 10 uppercase letters or digits."
+            exit 2
+          fi
+          if [[ "$SIGNING_TEAM_ID" != "$XBUILD_SIGNING_SET" ]]; then
+            echo "::error title=Apple Team mismatch::The selected Team ID does not match the Team ID stored in its GitHub secret namespace."
+            exit 2
+          fi
+          printf 'auth_method=%s\n' "$selected_auth" >> "$GITHUB_OUTPUT"
+          echo "TestFlight authentication preflight passed using $selected_auth."
+
+      - name: Upload App Store IPA with API key
+        if: ${{ steps.testflight_auth.outputs.auth_method == 'api-key' }}
+        shell: bash
+        env:
+          XBUILD_TESTFLIGHT_AUTH_METHOD: api-key
           XBUILD_ASC_KEY_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] }}
           XBUILD_ASC_ISSUER_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] }}
           XBUILD_ASC_PRIVATE_KEY_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] }}
+        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR"
+
+      - name: Upload App Store IPA with Apple ID
+        if: ${{ steps.testflight_auth.outputs.auth_method == 'apple-id' }}
+        shell: bash
+        env:
+          XBUILD_TESTFLIGHT_AUTH_METHOD: apple-id
           XBUILD_APPLE_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] }}
           XBUILD_APP_SPECIFIC_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] }}
           XBUILD_APPLE_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
-        run: |
-          set -euo pipefail
-          app_store_ipas=()
-          while IFS= read -r -d '' ipa; do
-            app_store_ipas+=("$ipa")
-          done < <(find "$XBUILD_OUTPUT_DIR" -type f -name '*-AppStore.ipa' -print0)
-          if (( ${#app_store_ipas[@]} != 1 )); then
-            echo "::error title=App Store IPA missing::Expected exactly one *-AppStore.ipa in the isolated artifact, found ${#app_store_ipas[@]}."
-            exit 44
-          fi
-          bash scripts/macos/upload-testflight.sh "${app_store_ipas[0]}" "$XBUILD_LOG_DIR"
+        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR"
 
       - name: Upload TestFlight diagnostics
         if: ${{ failure() }}
@@ -599,6 +781,36 @@ jobs:
           path: ${{ env.XBUILD_LOG_DIR }}
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Delete temporary IPA release
+        if: ${{ always() && inputs.cleanup_upload }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
+          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ || ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
+            echo "::warning title=IPA upload retained::Refusing to delete an upload with an unexpected release ID or tag."
+            exit 0
+          fi
+          release_json="$XBUILD_TESTFLIGHT_WORK_DIR/cleanup-release.json"
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json" 2>/dev/null; then
+            echo "Temporary IPA release was already removed."
+            exit 0
+          fi
+          actual_tag="$(jq -r '.tag_name' "$release_json")"
+          is_draft="$(jq -r '.draft' "$release_json")"
+          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
+            echo "::warning title=IPA upload retained::Release ID, tag, or draft state no longer matches the temporary upload."
+            exit 0
+          fi
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID"
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$UPLOAD_RELEASE_TAG" >/dev/null 2>&1 || true
+          rm -f -- "$release_json"
+          echo "Deleted temporary IPA draft release '$UPLOAD_RELEASE_TAG' (ID $UPLOAD_RELEASE_ID)."
 
       - name: Remove isolated upload files
         if: ${{ always() }}

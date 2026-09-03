@@ -10,7 +10,7 @@ signing_map="${XBUILD_SIGNING_MAP:?XBUILD_SIGNING_MAP is required}"
 work_dir="${XBUILD_WORK_DIR:?XBUILD_WORK_DIR is required}"
 output_dir="${XBUILD_OUTPUT_DIR:?XBUILD_OUTPUT_DIR is required}"
 log_dir="${XBUILD_LOG_DIR:?XBUILD_LOG_DIR is required}"
-upload_testflight="${XBUILD_UPLOAD_TESTFLIGHT:-false}"
+dual_export="${XBUILD_EXPORT_APPSTORE:-${XBUILD_UPLOAD_TESTFLIGHT:-false}}"
 export_method="${XBUILD_EXPORT_METHOD:?XBUILD_EXPORT_METHOD is required}"
 export_compliance="${XBUILD_EXPORT_COMPLIANCE:-preserve}"
 export_compliance_code="${XBUILD_EXPORT_COMPLIANCE_CODE:-}"
@@ -41,7 +41,7 @@ for line in sys.stdin:
 }
 
 compliance_applies=false
-if [[ "$export_method" == "app-store" || "$upload_testflight" == "true" ]]; then
+if [[ "$export_method" == "app-store" || "$dual_export" == "true" ]]; then
   compliance_applies=true
   source_dir="${XBUILD_SOURCE_DIR:?XBUILD_SOURCE_DIR is required for App Store export compliance}"
   detected_build="${XBUILD_DETECTED_BUILD_FILE:?XBUILD_DETECTED_BUILD_FILE is required for App Store export compliance}"
@@ -71,9 +71,9 @@ if [[ "$export_method" == "app-store" || "$upload_testflight" == "true" ]]; then
   esac
 fi
 
-if [[ "$upload_testflight" == "true" ]]; then
-  source_dir="${XBUILD_SOURCE_DIR:?XBUILD_SOURCE_DIR is required for TestFlight mode}"
-  detected_build="${XBUILD_DETECTED_BUILD_FILE:?XBUILD_DETECTED_BUILD_FILE is required for TestFlight mode}"
+if [[ "$dual_export" == "true" ]]; then
+  source_dir="${XBUILD_SOURCE_DIR:?XBUILD_SOURCE_DIR is required for dual export}"
+  detected_build="${XBUILD_DETECTED_BUILD_FILE:?XBUILD_DETECTED_BUILD_FILE is required for dual export}"
   build_number_file="$work_dir/project-build-number.txt"
   python3 scripts/macos/set-build-number.py resolve \
     --source-root "$source_dir" \
@@ -117,7 +117,7 @@ if [[ ! -d "$archive_path" ]]; then
   exit 41
 fi
 
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   python3 scripts/macos/set-build-number.py verify \
     --archive "$archive_path" \
     --build-number "$build_number"
@@ -181,18 +181,18 @@ export_archive() {
 
   if [[ -n "$env_name" ]]; then
     if (( ${#ipas[@]} != 1 )); then
-      echo "::error title=Ambiguous IPA export::$label export produced ${#ipas[@]} IPA files; TestFlight mode requires exactly one."
+      echo "::error title=Ambiguous IPA export::$label export produced ${#ipas[@]} IPA files; dual export requires exactly one."
       exit 42
     fi
     if [[ -z "${GITHUB_ENV:-}" ]]; then
-      echo "::error title=GitHub environment unavailable::GITHUB_ENV is required for TestFlight mode."
+      echo "::error title=GitHub environment unavailable::GITHUB_ENV is required for dual export."
       exit 42
     fi
     printf '%s=%s\n' "$env_name" "${ipas[0]}" >> "$GITHUB_ENV"
   fi
 }
 
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   adhoc_signing_map="${XBUILD_SIGNING_MAP_ADHOC:?XBUILD_SIGNING_MAP_ADHOC is required}"
   appstore_signing_map="${XBUILD_SIGNING_MAP_APPSTORE:?XBUILD_SIGNING_MAP_APPSTORE is required}"
   export_archive "Ad Hoc" "ad-hoc" "$adhoc_signing_map" "$output_dir/ad-hoc" "xcodebuild-export-ad-hoc.log" "AdHoc" "XBUILD_ADHOC_IPA"
@@ -232,8 +232,15 @@ try:
 except Exception:
     xcode_version = "unknown"
 
+dual_export_value = (
+    os.environ.get("XBUILD_EXPORT_APPSTORE")
+    or os.environ.get("XBUILD_UPLOAD_TESTFLIGHT", "false")
+)
+dual_export = dual_export_value == "true"
+app_store_exported = dual_export or os.environ.get("XBUILD_EXPORT_METHOD") == "app-store"
+
 manifest = {
-    "schema_version": 2 if os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true" else 1,
+    "schema_version": 3 if dual_export else 1,
     "build_id": os.environ.get("XBUILD_BUILD_ID", ""),
     "github_run_id": os.environ.get("GITHUB_RUN_ID", ""),
     "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
@@ -245,15 +252,17 @@ manifest = {
     "bundle_identifier": os.environ.get("XBUILD_BUNDLE_IDENTIFIER", ""),
     "export_method": (
         "ad-hoc+app-store"
-        if os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true"
+        if dual_export
         else signing["export_method"]
     ),
     "build_number": os.environ.get("XBUILD_EFFECTIVE_BUILD_NUMBER", ""),
-    "testflight_requested": os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true",
+    "app_store_exported": app_store_exported,
+    "testflight_requested": False,
+    "testflight_uploaded": False,
+    "testflight_upload_deferred": app_store_exported,
     "export_compliance": (
         os.environ.get("XBUILD_EXPORT_COMPLIANCE", "preserve")
-        if os.environ.get("XBUILD_EXPORT_METHOD") == "app-store"
-        or os.environ.get("XBUILD_UPLOAD_TESTFLIGHT") == "true"
+        if app_store_exported
         else "not-applicable"
     ),
     "team_id": signing["team_id"],

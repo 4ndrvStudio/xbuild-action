@@ -194,7 +194,7 @@ set -e
 echo "::endgroup::"
 
 if (( upload_status != 0 )); then
-  echo "::error title=TestFlight upload failed::altool exited with status $upload_status. The Ad Hoc IPA remains in the GitHub artifact."
+  echo "::error title=TestFlight upload failed::altool exited with status $upload_status. The local App Store IPA is unchanged, so the upload can be retried without rebuilding."
   exit "$upload_status"
 fi
 

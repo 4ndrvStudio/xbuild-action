@@ -9,7 +9,7 @@ github_env_file="${2:?Usage: install-signing.sh <bundle-ids-file> <github-env-fi
 signing_dir="${XBUILD_SIGNING_DIR:?XBUILD_SIGNING_DIR is required}"
 export_method="${XBUILD_EXPORT_METHOD:?XBUILD_EXPORT_METHOD is required}"
 signing_set="${XBUILD_SIGNING_SET:-}"
-upload_testflight="${XBUILD_UPLOAD_TESTFLIGHT:-false}"
+dual_export="${XBUILD_EXPORT_APPSTORE:-${XBUILD_UPLOAD_TESTFLIGHT:-false}}"
 
 mkdir -p "$signing_dir"
 
@@ -23,13 +23,13 @@ case "$export_method" in
     ;;
 esac
 
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   if [[ "$export_method" != "ad-hoc" ]]; then
-    echo "::error title=Invalid dual signing::TestFlight mode must use ad-hoc as the primary export method."
+    echo "::error title=Invalid dual signing::Dual export must use ad-hoc as the primary export method."
     exit 32
   fi
   if [[ -z "$signing_set" || ! "$signing_set" =~ ^[A-Z0-9][A-Z0-9_]{0,31}$ ]]; then
-    echo "::error title=Named signing set required::TestFlight mode requires a valid named signing set."
+    echo "::error title=Named signing set required::Dual Ad Hoc and App Store export requires a valid named signing set."
     exit 32
   fi
   secret_prefix="XBUILD_SIGNING_${signing_set}"
@@ -88,7 +88,7 @@ if [[ -z "$profiles_base64" ]]; then
   exit 32
 fi
 
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   mkdir -p "$signing_dir/raw-profiles-ad-hoc" "$signing_dir/profile-metadata-ad-hoc" "$signing_dir/raw-profiles-app-store" "$signing_dir/profile-metadata-app-store"
   raw_profiles_dir="$signing_dir/raw-profiles-ad-hoc"
   metadata_dir="$signing_dir/profile-metadata-ad-hoc"
@@ -184,7 +184,7 @@ decode_profile_payload "$profiles_base64" "$profiles_blob"
 extract_profiles "$profiles_blob" "$raw_profiles_dir"
 decode_profile_metadata "$raw_profiles_dir" "$metadata_dir"
 
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   decode_profile_payload "$appstore_profiles_base64" "$appstore_profiles_blob"
   extract_profiles "$appstore_profiles_blob" "$signing_dir/raw-profiles-app-store"
   decode_profile_metadata "$signing_dir/raw-profiles-app-store" "$signing_dir/profile-metadata-app-store"
@@ -235,7 +235,7 @@ security unlock-keychain -p "$keychain_password" "$keychain_path"
 security import "$certificate_path" \
   -k "$keychain_path" \
   -P "$certificate_password" \
-  -A \
+  -T /usr/bin/codesign \
   -t cert \
   -f pkcs12
 security set-key-partition-list \
@@ -259,7 +259,7 @@ if ! certificate_identity="$(xbuild_select_signing_identity "$export_method" "$i
 fi
 
 maps_to_install=("$signing_map")
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   maps_to_install=("$adhoc_signing_map" "$appstore_signing_map")
 fi
 
@@ -304,7 +304,7 @@ done
 
 printf 'XBUILD_KEYCHAIN_PATH=%s\n' "$keychain_path" >> "$github_env_file"
 printf 'XBUILD_SIGNING_MAP=%s\n' "$signing_map" >> "$github_env_file"
-if [[ "$upload_testflight" == "true" ]]; then
+if [[ "$dual_export" == "true" ]]; then
   printf 'XBUILD_SIGNING_MAP_ADHOC=%s\n' "$adhoc_signing_map" >> "$github_env_file"
   printf 'XBUILD_SIGNING_MAP_APPSTORE=%s\n' "$appstore_signing_map" >> "$github_env_file"
 fi
