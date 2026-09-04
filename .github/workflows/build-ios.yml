@@ -207,6 +207,11 @@ jobs:
     if: ${{ inputs.operation == 'build' }}
     runs-on: ${{ vars.XBUILD_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 120
+    permissions:
+      actions: read
+      # GitHub requires push-level access even when reading a draft release.
+      # The token is exposed only to the download step and checkout never persists it.
+      contents: write
     env:
       XBUILD_BUILD_ID: ${{ inputs.build_id }}
       XBUILD_SOURCE_SHA256: ${{ inputs.archive_sha256 }}
@@ -622,7 +627,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
-      contents: read
+      # The deferred IPA also travels through a draft release.
+      contents: write
     env:
       XBUILD_SIGNING_SET: ${{ inputs.signing_set }}
       XBUILD_XCODE_PATH: ${{ vars.XBUILD_XCODE_PATH }}
