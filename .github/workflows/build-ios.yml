@@ -98,14 +98,18 @@ on:
         default: ""
         type: string
       cleanup_upload:
-        description: Delete the temporary draft release after the run
+        description: Deprecated compatibility input; the desktop app deletes the upload after consuming the encrypted result
         required: true
         default: true
         type: boolean
+      transport_secret_name:
+        description: Per-run Actions secret containing the encrypted-artifact key
+        required: true
+        type: string
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: xbuild-ios-${{ inputs.upload_release_tag }}
@@ -159,14 +163,31 @@ jobs:
             --team '${{ inputs.signing_set }}' \
             --output "$output_dir/profile-index.json"
 
-      - name: Upload profile index
+      - name: Encrypt private profile index
+        shell: bash
+        env:
+          TRANSPORT_SECRET_NAME: ${{ inputs.transport_secret_name }}
+          XBUILD_TRANSPORT_KEY_BASE64: ${{ secrets[inputs.transport_secret_name] }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRANSPORT_SECRET_NAME" =~ ^XBUILD_TRANSPORT_[A-Z0-9_]+$ ]]; then
+            echo "::error title=Invalid transport secret::The per-run transport secret name is invalid."
+            exit 2
+          fi
+          private_dir="$XBUILD_PROFILE_INDEX_DIR/private"
+          mkdir -p -- "$private_dir"
+          bash scripts/macos/encrypt-artifact.sh \
+            "$XBUILD_PROFILE_INDEX_DIR/profile-index.json" \
+            "$private_dir/profile-index.xbe"
+
+      - name: Upload encrypted profile index
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: signing-profile-index-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.XBUILD_PROFILE_INDEX_DIR }}/profile-index.json
+          name: xbuild-private-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XBUILD_PROFILE_INDEX_DIR }}/private/profile-index.xbe
           if-no-files-found: error
           retention-days: 1
-          compression-level: 9
+          compression-level: 0
 
       - name: Remove temporary profile data
         if: ${{ always() }}
@@ -210,6 +231,7 @@ jobs:
           output_dir="$work_dir/output"
           log_dir="$work_dir/logs"
           signing_dir="$work_dir/signing"
+          private_result_dir="$work_dir/private-result"
 
           {
             printf 'XBUILD_WORK_DIR=%s\n' "$work_dir"
@@ -217,9 +239,10 @@ jobs:
             printf 'XBUILD_OUTPUT_DIR=%s\n' "$output_dir"
             printf 'XBUILD_LOG_DIR=%s\n' "$log_dir"
             printf 'XBUILD_SIGNING_DIR=%s\n' "$signing_dir"
+            printf 'XBUILD_PRIVATE_RESULT_DIR=%s\n' "$private_result_dir"
           } >> "$GITHUB_ENV"
 
-          mkdir -p -- "$work_dir" "$source_dir" "$output_dir" "$log_dir" "$signing_dir"
+          mkdir -p -- "$work_dir" "$source_dir" "$output_dir" "$log_dir" "$signing_dir" "$private_result_dir"
           printf 'XBuild run %s initialized.\n' "$GITHUB_RUN_ID" > "$log_dir/xbuild-run.txt"
 
       - name: Check out trusted build scripts
@@ -451,11 +474,11 @@ jobs:
 
       - name: Extract and validate Xcode project
         shell: bash
-        run: bash scripts/macos/prepare-source.sh "$XBUILD_SOURCE_ARCHIVE" "$XBUILD_SOURCE_DIR"
+        run: bash scripts/macos/prepare-source.sh "$XBUILD_SOURCE_ARCHIVE" "$XBUILD_SOURCE_DIR" > "$XBUILD_LOG_DIR/prepare-source.log" 2>&1
 
       - name: Install CocoaPods dependencies on macOS
         shell: bash
-        run: bash scripts/macos/install-cocoapods.sh "$XBUILD_SOURCE_DIR" "$XBUILD_LOG_DIR" "$XBUILD_PROJECT_HINT"
+        run: bash scripts/macos/install-cocoapods.sh "$XBUILD_SOURCE_DIR" "$XBUILD_LOG_DIR" "$XBUILD_PROJECT_HINT" > "$XBUILD_LOG_DIR/cocoapods-console.log" 2>&1
 
       # Podfiles are executable Ruby and may run hooks. Restore the repository
       # checkout before any signing secret is materialized so an uploaded
@@ -470,7 +493,7 @@ jobs:
 
       - name: Detect Xcode container, scheme, configuration, and bundle ID
         shell: bash
-        run: bash scripts/macos/detect-xcode.sh "$XBUILD_SOURCE_DIR" "$GITHUB_ENV" "$XBUILD_WORK_DIR"
+        run: bash scripts/macos/detect-xcode.sh "$XBUILD_SOURCE_DIR" "$GITHUB_ENV" "$XBUILD_WORK_DIR" > "$XBUILD_LOG_DIR/detect-xcode.log" 2>&1
 
       - name: Verify trusted signing scripts
         shell: bash
@@ -531,73 +554,54 @@ jobs:
           XBUILD_COMMON_PROFILES_BASE64: ${{ inputs.signing_set == '' && secrets.IOS_PROVISIONING_PROFILES_BASE64 || '' }}
           XBUILD_COMMON_PROFILE_BASE64: ${{ inputs.signing_set == '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 || '' }}
           XBUILD_LEGACY_TEAM_ID_OVERRIDE: ${{ inputs.signing_set == '' && secrets.APPLE_TEAM_ID || '' }}
-        run: bash scripts/macos/install-signing.sh "$XBUILD_BUNDLE_IDS_FILE" "$GITHUB_ENV"
+        run: bash scripts/macos/install-signing.sh "$XBUILD_BUNDLE_IDS_FILE" "$GITHUB_ENV" > "$XBUILD_LOG_DIR/install-signing.log" 2>&1
 
       - name: Configure Xcode targets for manual signing
         shell: bash
-        run: bash scripts/macos/configure-signing.sh "$XBUILD_SOURCE_DIR" "$XBUILD_SIGNING_MAP" "$XBUILD_DETECTED_BUILD_FILE"
+        run: bash scripts/macos/configure-signing.sh "$XBUILD_SOURCE_DIR" "$XBUILD_SIGNING_MAP" "$XBUILD_DETECTED_BUILD_FILE" > "$XBUILD_LOG_DIR/configure-signing.log" 2>&1
 
       - name: Archive and export IPA
         shell: bash
-        run: bash scripts/macos/build-ipa.sh
+        run: bash scripts/macos/build-ipa.sh > "$XBUILD_LOG_DIR/build-console.log" 2>&1
 
-      - name: Upload IPA artifact
+      - name: Encrypt private IPA and build logs
+        if: ${{ always() }}
+        shell: bash
+        env:
+          TRANSPORT_SECRET_NAME: ${{ inputs.transport_secret_name }}
+          XBUILD_TRANSPORT_KEY_BASE64: ${{ secrets[inputs.transport_secret_name] }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRANSPORT_SECRET_NAME" =~ ^XBUILD_TRANSPORT_[A-Z0-9_]+$ ]]; then
+            echo "::error title=Invalid transport secret::The per-run transport secret name is invalid."
+            exit 2
+          fi
+          inner_zip="$XBUILD_WORK_DIR/private-build-result.zip"
+          rm -f -- "$inner_zip"
+          (
+            cd "$XBUILD_WORK_DIR"
+            zip -qry -X "$inner_zip" output logs
+          )
+          bash scripts/macos/encrypt-artifact.sh \
+            "$inner_zip" \
+            "$XBUILD_PRIVATE_RESULT_DIR/build-result.xbe"
+          rm -f -- "$inner_zip"
+
+      - name: Upload encrypted private result
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ios-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.XBUILD_OUTPUT_DIR }}
-            ${{ env.XBUILD_LOG_DIR }}
+          name: xbuild-private-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XBUILD_PRIVATE_RESULT_DIR }}/build-result.xbe
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 1
           compression-level: 0
-
-      - name: Upload diagnostics when the build fails
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.XBUILD_LOG_DIR }}
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Remove temporary signing material
         if: ${{ always() }}
         continue-on-error: true
         shell: bash
         run: bash scripts/macos/cleanup-signing.sh
-
-      - name: Delete temporary upload release
-        if: ${{ always() && inputs.cleanup_upload }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
-          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$XBUILD_WORK_DIR"
-          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ || ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
-            echo "::warning title=Upload retained::Refusing to delete an upload with an unexpected release ID or tag."
-            exit 0
-          fi
-          release_json="$XBUILD_WORK_DIR/cleanup-release.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json" 2>/dev/null; then
-            echo "Temporary release was already removed."
-            exit 0
-          fi
-          actual_tag="$(jq -r '.tag_name' "$release_json")"
-          is_draft="$(jq -r '.draft' "$release_json")"
-          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
-            echo "::warning title=Upload retained::Release ID, tag, or draft state no longer matches the temporary upload."
-            exit 0
-          fi
-          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID"
-          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$UPLOAD_RELEASE_TAG" >/dev/null 2>&1 || true
-          rm -f -- "$release_json"
-          echo "Deleted temporary draft release '$UPLOAD_RELEASE_TAG' (ID $UPLOAD_RELEASE_ID)."
 
       - name: Remove build temporary files
         if: ${{ always() }}
@@ -618,7 +622,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       actions: read
-      contents: write
+      contents: read
     env:
       XBUILD_SIGNING_SET: ${{ inputs.signing_set }}
       XBUILD_XCODE_PATH: ${{ vars.XBUILD_XCODE_PATH }}
@@ -632,13 +636,15 @@ jobs:
           output_dir="$work_dir/output"
           log_dir="$work_dir/logs"
           signing_dir="$work_dir/signing"
+          private_result_dir="$work_dir/private-result"
           {
             printf 'XBUILD_TESTFLIGHT_WORK_DIR=%s\n' "$work_dir"
             printf 'XBUILD_OUTPUT_DIR=%s\n' "$output_dir"
             printf 'XBUILD_LOG_DIR=%s\n' "$log_dir"
             printf 'XBUILD_SIGNING_DIR=%s\n' "$signing_dir"
+            printf 'XBUILD_PRIVATE_RESULT_DIR=%s\n' "$private_result_dir"
           } >> "$GITHUB_ENV"
-          mkdir -p -- "$output_dir" "$log_dir" "$signing_dir"
+          mkdir -p -- "$output_dir" "$log_dir" "$signing_dir" "$private_result_dir"
           printf 'XBuild deferred TestFlight run %s initialized.\n' "$GITHUB_RUN_ID" > "$log_dir/xbuild-testflight-run.txt"
 
       - name: Check out trusted upload script
@@ -841,7 +847,7 @@ jobs:
           XBUILD_ASC_KEY_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_KEY_ID', inputs.signing_set)] }}
           XBUILD_ASC_ISSUER_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_ISSUER_ID', inputs.signing_set)] }}
           XBUILD_ASC_PRIVATE_KEY_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_STORE_CONNECT_PRIVATE_KEY_BASE64', inputs.signing_set)] }}
-        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR"
+        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR" > "$XBUILD_LOG_DIR/testflight-console.log" 2>&1
 
       - name: Upload App Store IPA with Apple ID
         if: ${{ steps.testflight_auth.outputs.auth_method == 'apple-id' }}
@@ -851,46 +857,39 @@ jobs:
           XBUILD_APPLE_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_APPLE_ID', inputs.signing_set)] }}
           XBUILD_APP_SPECIFIC_PASSWORD: ${{ secrets[format('XBUILD_SIGNING_{0}_APP_SPECIFIC_PASSWORD', inputs.signing_set)] }}
           XBUILD_APPLE_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
-        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR"
+        run: bash scripts/macos/upload-testflight.sh "$XBUILD_TESTFLIGHT_IPA" "$XBUILD_LOG_DIR" > "$XBUILD_LOG_DIR/testflight-console.log" 2>&1
 
-      - name: Upload TestFlight diagnostics
+      - name: Encrypt private TestFlight diagnostics
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          TRANSPORT_SECRET_NAME: ${{ inputs.transport_secret_name }}
+          XBUILD_TRANSPORT_KEY_BASE64: ${{ secrets[inputs.transport_secret_name] }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TRANSPORT_SECRET_NAME" =~ ^XBUILD_TRANSPORT_[A-Z0-9_]+$ ]]; then
+            echo "::error title=Invalid transport secret::The per-run transport secret name is invalid."
+            exit 2
+          fi
+          inner_zip="$XBUILD_TESTFLIGHT_WORK_DIR/private-testflight-diagnostics.zip"
+          (
+            cd "$XBUILD_TESTFLIGHT_WORK_DIR"
+            zip -qry -X "$inner_zip" logs
+          )
+          bash scripts/macos/encrypt-artifact.sh \
+            "$inner_zip" \
+            "$XBUILD_PRIVATE_RESULT_DIR/testflight-diagnostics.xbe"
+          rm -f -- "$inner_zip"
+
+      - name: Upload encrypted TestFlight diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-testflight
-          path: ${{ env.XBUILD_LOG_DIR }}
+          name: xbuild-private-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XBUILD_PRIVATE_RESULT_DIR }}/testflight-diagnostics.xbe
           if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Delete temporary IPA release
-        if: ${{ always() && inputs.cleanup_upload }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          UPLOAD_RELEASE_TAG: ${{ inputs.upload_release_tag }}
-          UPLOAD_RELEASE_ID: ${{ inputs.upload_release_id }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$UPLOAD_RELEASE_ID" =~ ^[0-9]+$ || ! "$UPLOAD_RELEASE_TAG" =~ ^xbuild-upload-[A-Za-z0-9._-]+$ ]]; then
-            echo "::warning title=IPA upload retained::Refusing to delete an upload with an unexpected release ID or tag."
-            exit 0
-          fi
-          release_json="$XBUILD_TESTFLIGHT_WORK_DIR/cleanup-release.json"
-          if ! gh api "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID" > "$release_json" 2>/dev/null; then
-            echo "Temporary IPA release was already removed."
-            exit 0
-          fi
-          actual_tag="$(jq -r '.tag_name' "$release_json")"
-          is_draft="$(jq -r '.draft' "$release_json")"
-          if [[ "$actual_tag" != "$UPLOAD_RELEASE_TAG" || "$is_draft" != "true" ]]; then
-            echo "::warning title=IPA upload retained::Release ID, tag, or draft state no longer matches the temporary upload."
-            exit 0
-          fi
-          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$UPLOAD_RELEASE_ID"
-          gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$UPLOAD_RELEASE_TAG" >/dev/null 2>&1 || true
-          rm -f -- "$release_json"
-          echo "Deleted temporary IPA draft release '$UPLOAD_RELEASE_TAG' (ID $UPLOAD_RELEASE_ID)."
+          retention-days: 1
+          compression-level: 0
 
       - name: Remove isolated upload files
         if: ${{ always() }}
