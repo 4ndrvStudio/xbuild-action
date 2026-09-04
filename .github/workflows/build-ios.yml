@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build IPA files or upload a previously built App Store IPA
+        description: Build IPA files, inspect saved profiles, or upload an existing App Store IPA
         required: true
         default: build
         type: choice
         options:
           - build
+          - inspect-signing
           - upload-testflight
       build_id:
         description: Unique desktop build ID used to correlate the dispatched run
@@ -111,6 +112,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  inspect-signing:
+    name: Inspect saved provisioning profiles on Linux
+    if: ${{ inputs.operation == 'inspect-signing' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Validate signing-set request
+        shell: bash
+        env:
+          SIGNING_SET: ${{ inputs.signing_set }}
+          SIGNING_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SIGNING_SET" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "::error title=Invalid Apple Team::signing_set must be a 10-character Apple Team ID."
+            exit 2
+          fi
+          if [[ -n "$SIGNING_TEAM_ID" && "$SIGNING_TEAM_ID" != "$SIGNING_SET" ]]; then
+            echo "::error title=Apple Team mismatch::The selected Team does not match its stored Team ID secret."
+            exit 2
+          fi
+
+      - name: Check out trusted profile inspector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Extract non-secret profile metadata
+        shell: bash
+        env:
+          SIGNING_TEAM_ID: ${{ secrets[format('XBUILD_SIGNING_{0}_TEAM_ID', inputs.signing_set)] }}
+          ADHOC_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_ADHOC_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_ADHOC_BASE64', inputs.signing_set)] }}
+          APPSTORE_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_APPSTORE_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_APPSTORE_BASE64', inputs.signing_set)] }}
+          DEVELOPMENT_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_DEVELOPMENT_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_DEVELOPMENT_BASE64', inputs.signing_set)] }}
+        run: |
+          set -euo pipefail
+          umask 077
+          output_dir="${RUNNER_TEMP%/}/xbuild-profile-index-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p -- "$output_dir"
+          printf 'XBUILD_PROFILE_INDEX_DIR=%s\n' "$output_dir" >> "$GITHUB_ENV"
+          python3 scripts/common/inspect-profiles.py \
+            --team '${{ inputs.signing_set }}' \
+            --output "$output_dir/profile-index.json"
+
+      - name: Upload profile index
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signing-profile-index-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XBUILD_PROFILE_INDEX_DIR }}/profile-index.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+
+      - name: Remove temporary profile data
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_prefix="${RUNNER_TEMP%/}/xbuild-profile-index-"
+          case "${XBUILD_PROFILE_INDEX_DIR:-}" in
+            "$expected_prefix"*) rm -rf -- "$XBUILD_PROFILE_INDEX_DIR" ;;
+            "") ;;
+            *) echo "::warning title=Cleanup skipped::Unexpected profile-index directory." ;;
+          esac
+
   build-ios:
     name: Build IPA on macOS
     if: ${{ inputs.operation == 'build' }}
