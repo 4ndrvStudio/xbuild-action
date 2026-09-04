@@ -252,11 +252,16 @@ jobs:
           fi
           sw_vers
           echo "Architecture: $(uname -m)"
-          xcodebuild -version
+          xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$xcode_version"
           ruby --version
           pod --version || echo "CocoaPods is not preinstalled; it will be installed if a Podfile is found."
 
-          xcode_major="$(xcodebuild -version | awk '/^Xcode / { split($2, version, "."); print version[1]; exit }')"
+          if [[ "$xcode_version" =~ ^Xcode[[:space:]]+([0-9]+) ]]; then
+            xcode_major="${BASH_REMATCH[1]}"
+          else
+            xcode_major=""
+          fi
           if [[ "$XBUILD_EXPORT_METHOD" == "app-store" || "$XBUILD_EXPORT_APPSTORE" == "true" ]] &&
              { [[ ! "$xcode_major" =~ ^[0-9]+$ ]] || (( xcode_major < 26 )); }; then
             echo "::error title=Xcode 26 required::App Store Connect uploads have required Xcode 26 or newer since April 28, 2026. Select a compatible runner/Xcode using XBUILD_MACOS_RUNNER and XBUILD_XCODE_PATH."
@@ -663,8 +668,13 @@ jobs:
             fi
             sudo xcode-select --switch "$developer_dir"
           fi
-          xcodebuild -version
-          xcode_major="$(xcodebuild -version | awk '/^Xcode / { split($2, version, "."); print version[1]; exit }')"
+          xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$xcode_version"
+          if [[ "$xcode_version" =~ ^Xcode[[:space:]]+([0-9]+) ]]; then
+            xcode_major="${BASH_REMATCH[1]}"
+          else
+            xcode_major=""
+          fi
           if [[ ! "$xcode_major" =~ ^[0-9]+$ ]] || (( xcode_major < 26 )); then
             echo "::error title=Xcode 26 required::App Store Connect uploads require Xcode 26 or newer. Select a compatible runner/Xcode using XBUILD_MACOS_RUNNER and XBUILD_XCODE_PATH."
             exit 2
