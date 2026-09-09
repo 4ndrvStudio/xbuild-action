@@ -30,35 +30,9 @@ def safe_value(label: str, value: str) -> str:
 
 def excluded(path: pathlib.Path) -> bool:
     lowered = {part.lower() for part in path.parts}
-    if lowered.intersection(
-        {
-            "pods", "node_modules", "deriveddata", "__macosx", ".git",
-            ".yarn", ".pnpm-store", ".npm", ".expo", ".cache",
-        }
-    ):
+    if lowered.intersection({"pods", "deriveddata", "__macosx", ".git"}):
         return True
     return path.name == "project.xcworkspace" and path.parent.suffix == ".xcodeproj"
-
-
-def find_containers(source_root: pathlib.Path) -> tuple[list[pathlib.Path], list[pathlib.Path]]:
-    workspaces: list[pathlib.Path] = []
-    projects: list[pathlib.Path] = []
-    for directory, names, _ in os.walk(source_root):
-        descend: list[str] = []
-        for name in names:
-            path = pathlib.Path(directory) / name
-            if excluded(path.relative_to(source_root)):
-                continue
-            if path.suffix == ".xcworkspace":
-                workspaces.append(path)
-            elif path.suffix == ".xcodeproj":
-                projects.append(path)
-            else:
-                descend.append(name)
-        # Dependencies can contain thousands of native sample projects. Prune
-        # their directories before walking them, as well as Xcode package contents.
-        names[:] = descend
-    return sorted(workspaces, key=container_score), sorted(projects, key=container_score)
 
 
 def load_json_output(command: list[str], log_path: pathlib.Path) -> Any:
@@ -308,7 +282,14 @@ def main() -> int:
         if hint_path.is_absolute() or ".." in hint_path.parts or pathlib.PureWindowsPath(project_hint).is_absolute():
             fail("Invalid project hint", "project_hint must stay inside the uploaded source directory.")
 
-    workspaces, projects = find_containers(source_root)
+    workspaces = sorted(
+        (path for path in source_root.rglob("*.xcworkspace") if path.is_dir() and not excluded(path)),
+        key=container_score,
+    )
+    projects = sorted(
+        (path for path in source_root.rglob("*.xcodeproj") if path.is_dir() and not excluded(path)),
+        key=container_score,
+    )
     containers = [("workspace", path) for path in workspaces] + [("project", path) for path in projects]
     containers.sort(
         key=lambda item: hinted_container_rank(item[0], item[1], source_root, project_hint)

@@ -21,8 +21,7 @@ end
 
 def ignored_project?(path)
   lowered = path.each_filename.map(&:downcase)
-  ignored = %w[pods node_modules deriveddata __macosx .git .yarn .pnpm-store .npm .expo .cache]
-  (lowered & ignored).any?
+  lowered.include?('pods') || lowered.include?('deriveddata') || lowered.include?('.git')
 end
 
 def expanded_bundle_id(target, configuration, detected_by_target, profiles)

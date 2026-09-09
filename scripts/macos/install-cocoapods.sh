@@ -12,8 +12,11 @@ mkdir -p "$log_dir"
 podfiles=()
 while IFS= read -r -d '' file; do
   podfiles+=("$file")
-done < <(find "$source_root" -type d \( -name Pods -o -name node_modules -o -name vendor -o -name .bundle \) \
-  -prune -o -type f -name Podfile -print0)
+done < <(find "$source_root" -type f -name Podfile \
+  ! -path '*/Pods/*' \
+  ! -path '*/vendor/*' \
+  ! -path '*/.bundle/*' \
+  -print0)
 
 if (( ${#podfiles[@]} == 0 )); then
   echo "No Podfile was found; CocoaPods is not required for this export."
@@ -107,11 +110,11 @@ install_cocoapods_version() {
 }
 
 gemfile_cocoapods_status() {
-  local gemfile="$1"
+  local pod_dir="$1"
   local lockfile=""
-  [[ -f "$gemfile.lock" ]] && lockfile="$gemfile.lock"
+  [[ -f "$pod_dir/Gemfile.lock" ]] && lockfile="$pod_dir/Gemfile.lock"
 
-  ruby -rbundler - "$gemfile" "$lockfile" <<'RUBY'
+  ruby -rbundler - "$pod_dir/Gemfile" "$lockfile" <<'RUBY'
 begin
   gemfile = ARGV.fetch(0)
   lockfile = ARGV.fetch(1)
@@ -139,22 +142,17 @@ for podfile in "${podfiles[@]}"; do
 
   echo "::group::CocoaPods $index/${#podfiles[@]} — $pod_dir"
 
-  javascript_metadata="$log_dir/javascript-$index.json"
-  python3 "$script_dir/prepare-javascript-dependencies.py" "$source_root" "$podfile" "$javascript_metadata" \
-    2>&1 | tee "$log_dir/javascript-$index.log"
-  gemfile="$(python3 -c 'import json, pathlib, sys; value = json.load(open(sys.argv[1])).get("gemfile"); print(pathlib.Path(value).as_posix() if value else "", end="")' "$javascript_metadata")"
-
   if [[ -f "$pod_dir/Podfile.lock" ]]; then
     required_version="$(awk '/^COCOAPODS: / { print $2; exit }' "$pod_dir/Podfile.lock" | tr -d '\r')"
   fi
 
   pod_command=()
   use_bundler=false
-  if [[ -n "$gemfile" ]]; then
+  if [[ -f "$pod_dir/Gemfile" ]]; then
     if ! command -v bundle >/dev/null 2>&1; then
       sudo gem install bundler --no-document
     fi
-    if gemfile_cocoapods_status "$gemfile"; then
+    if gemfile_cocoapods_status "$pod_dir"; then
       use_bundler=true
     else
       gemfile_status=$?
@@ -175,12 +173,11 @@ for podfile in "${podfiles[@]}"; do
     fi
     bundle_dir="${XBUILD_WORK_DIR:-${RUNNER_TEMP:-/tmp}/xbuild}/bundle-$index"
     (
-      cd "$(dirname "$gemfile")"
-      export BUNDLE_GEMFILE="$gemfile"
+      cd "$pod_dir"
       bundle config set --local path "$bundle_dir"
       bundle install --jobs 4 --retry 3
     ) 2>&1 | tee "$log_dir/bundle-$index.log"
-    pod_command=(env "BUNDLE_GEMFILE=$gemfile" bundle exec pod)
+    pod_command=(bundle exec pod)
   else
     install_cocoapods_version "$required_version"
     if [[ -n "$required_version" ]]; then
@@ -248,7 +245,8 @@ for podfile in "${podfiles[@]}"; do
   fi
 done
 
-workspace_count="$(find "$source_root" -type d \( -name Pods -o -name node_modules \) -prune \
-  -o -type d -name '*.xcworkspace' ! -path '*.xcodeproj/project.xcworkspace' \
+workspace_count="$(find "$source_root" -type d -name '*.xcworkspace' \
+  ! -path '*/Pods/*' \
+  ! -path '*.xcodeproj/project.xcworkspace' \
   -print | wc -l | tr -d ' ')"
 echo "CocoaPods completed successfully; $workspace_count build workspace(s) are now available."
