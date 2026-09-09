@@ -26,9 +26,9 @@ def validate_build_number(value: str) -> str:
     if not BUILD_NUMBER.fullmatch(value):
         fail(
             "Invalid project build number",
-            f"The Unity-exported app resolves CFBundleVersion to {value!r}. "
+            f"The app resolves CFBundleVersion to {value!r}. "
             "TestFlight requires one to three dot-separated integers, for example 42 or 1.2.3. "
-            "Update Player Settings > iOS > Build in Unity and export the Xcode project again.",
+            "Update the iOS project build number (Unity: Player Settings > iOS > Build, then export again).",
         )
     return value
 
@@ -139,13 +139,13 @@ def resolve_project_build_number(
             fail(
                 "Project build number unresolved",
                 f"{target_name} uses {source_name}={raw_value!r}, but its Xcode build setting "
-                "could not be resolved. Set a numeric iOS Build value in Unity and export again.",
+                "could not be resolved. Set a numeric CFBundleVersion or CURRENT_PROJECT_VERSION in the iOS project.",
             )
         if not resolved:
             continue
         build_number = validate_build_number(resolved)
         print(
-            f"Using Unity-exported build number {build_number} "
+            f"Using project build number {build_number} "
             f"from {target_name} ({source_name})."
         )
         return build_number
@@ -153,7 +153,7 @@ def resolve_project_build_number(
     fail(
         "Project build number missing",
         f"{target_name} has no resolvable CFBundleVersion or CURRENT_PROJECT_VERSION. "
-        "Set Player Settings > iOS > Build in Unity and export the Xcode project again.",
+        "Set CFBundleVersion or CURRENT_PROJECT_VERSION in the iOS project (Unity: Player Settings > iOS > Build).",
     )
 
 
@@ -285,7 +285,7 @@ def verify_archive(archive: pathlib.Path, build_number: str) -> None:
     if actual != build_number:
         fail(
             "Archive build number mismatch",
-            f"{main_app.name} has CFBundleVersion {actual!r}, but the Unity project value is "
+            f"{main_app.name} has CFBundleVersion {actual!r}, but the source project value is "
             f"{build_number!r}. Check for a build phase or plugin that overrides the build number.",
         )
 

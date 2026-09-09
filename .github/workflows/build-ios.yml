@@ -1,4 +1,4 @@
-name: Build Unity iOS
+name: Build iOS
 
 run-name: xbuild • ${{ inputs.build_id }} • ${{ inputs.operation }}
 
@@ -481,11 +481,17 @@ jobs:
         shell: bash
         run: bash scripts/macos/prepare-source.sh "$XBUILD_SOURCE_ARCHIVE" "$XBUILD_SOURCE_DIR" > "$XBUILD_LOG_DIR/prepare-source.log" 2>&1
 
+      - name: Set up Node.js for React Native and Expo
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ vars.XBUILD_NODE_VERSION || '22' }}
+          package-manager-cache: false
+
       - name: Install CocoaPods dependencies on macOS
         shell: bash
         run: bash scripts/macos/install-cocoapods.sh "$XBUILD_SOURCE_DIR" "$XBUILD_LOG_DIR" "$XBUILD_PROJECT_HINT" > "$XBUILD_LOG_DIR/cocoapods-console.log" 2>&1
 
-      # Podfiles are executable Ruby and may run hooks. Restore the repository
+      # JavaScript install scripts and Podfiles may run hooks. Restore the repository
       # checkout before any signing secret is materialized so an uploaded
       # project cannot persist a replacement for XBuild's trusted scripts.
       - name: Restore trusted build scripts after CocoaPods
