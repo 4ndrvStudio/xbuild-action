@@ -127,6 +127,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--team", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--profiles-output", help="Optional private ZIP for a preserve-and-merge update; encrypt before upload")
     args = parser.parse_args()
     team = args.team.strip().upper()
     if len(team) != 10 or not team.isalnum() or not team.isascii():
@@ -137,13 +138,16 @@ def main() -> int:
         raise ValueError("selected Team ID does not match the stored Team ID secret")
 
     profiles: list[dict] = []
+    payloads: dict[tuple[str, str], bytes] = {}
     for method, environment_name in (
         ("ad-hoc", "ADHOC_PROFILES_BASE64"),
         ("app-store", "APPSTORE_PROFILES_BASE64"),
         ("development", "DEVELOPMENT_PROFILES_BASE64"),
     ):
         for file_name, data in decode_secret(os.environ.get(environment_name, ""), method):
-            profiles.append(profile_metadata(data, file_name, method, team))
+            metadata = profile_metadata(data, file_name, method, team)
+            profiles.append(metadata)
+            payloads[(method, metadata["uuid"])] = data
 
     unique = {
         (item["exportMethod"].lower(), item["uuid"].upper()): item
@@ -165,7 +169,13 @@ def main() -> int:
     }
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(output, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
+    index_json = json.dumps(output, ensure_ascii=True, separators=(",", ":"))
+    output_path.write_text(index_json, encoding="utf-8")
+    if args.profiles_output:
+        with zipfile.ZipFile(args.profiles_output, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("profile-index.json", index_json)
+            for number, ((method, _uuid), data) in enumerate(payloads.items()):
+                archive.writestr(f"{method}/{number:03d}.mobileprovision", data)
     print(f"Indexed {len(profiles)} provisioning profile(s) for Team {team}.")
     return 0
 

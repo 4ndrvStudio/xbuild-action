@@ -14,6 +14,11 @@ on:
           - build
           - inspect-signing
           - upload-testflight
+      include_signing_profiles:
+        description: Return encrypted existing profiles for a preserve-and-merge Team update
+        required: false
+        default: false
+        type: boolean
       build_id:
         description: Unique desktop build ID used to correlate the dispatched run
         required: true
@@ -153,15 +158,20 @@ jobs:
           ADHOC_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_ADHOC_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_ADHOC_BASE64', inputs.signing_set)] }}
           APPSTORE_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_APPSTORE_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_APPSTORE_BASE64', inputs.signing_set)] }}
           DEVELOPMENT_PROFILES_BASE64: ${{ secrets[format('XBUILD_SIGNING_{0}_PROVISIONING_PROFILES_DEVELOPMENT_BASE64', inputs.signing_set)] || secrets[format('XBUILD_SIGNING_{0}_PROFILE_DEVELOPMENT_BASE64', inputs.signing_set)] }}
+          INCLUDE_SIGNING_PROFILES: ${{ inputs.include_signing_profiles }}
         run: |
           set -euo pipefail
           umask 077
           output_dir="${RUNNER_TEMP%/}/xbuild-profile-index-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p -- "$output_dir"
           printf 'XBUILD_PROFILE_INDEX_DIR=%s\n' "$output_dir" >> "$GITHUB_ENV"
+          extra_args=()
+          if [[ "$INCLUDE_SIGNING_PROFILES" == "true" ]]; then
+            extra_args=(--profiles-output "$output_dir/profiles.zip")
+          fi
           python3 scripts/common/inspect-profiles.py \
             --team '${{ inputs.signing_set }}' \
-            --output "$output_dir/profile-index.json"
+            --output "$output_dir/profile-index.json" "${extra_args[@]}"
 
       - name: Encrypt private profile index
         shell: bash
@@ -176,8 +186,12 @@ jobs:
           fi
           private_dir="$XBUILD_PROFILE_INDEX_DIR/private"
           mkdir -p -- "$private_dir"
+          payload="$XBUILD_PROFILE_INDEX_DIR/profile-index.json"
+          if [[ -f "$XBUILD_PROFILE_INDEX_DIR/profiles.zip" ]]; then
+            payload="$XBUILD_PROFILE_INDEX_DIR/profiles.zip"
+          fi
           bash scripts/macos/encrypt-artifact.sh \
-            "$XBUILD_PROFILE_INDEX_DIR/profile-index.json" \
+            "$payload" \
             "$private_dir/profile-index.xbe"
 
       - name: Upload encrypted profile index
